@@ -77,6 +77,36 @@
           if (!el) return;
           el.scrollTop = el.scrollHeight;
         },
+        // Fetch bridge (very simple, last-result cache)
+        js_fetch_get: (url_ptr, url_len, cb_id) => {
+          const url = s(url_ptr, url_len);
+          if (!window.__fetchCache) window.__fetchCache = { status: 0, body: '' };
+          const headers = {};
+          if (window.__authToken) headers['authorization'] = `Bearer ${window.__authToken}`;
+          fetch(url, { method: 'GET', headers })
+            .then(r => (window.__fetchCache.status = r.status, r.text()))
+            .then(t => { window.__fetchCache.body = t; if (wmi?.exports?.on_event) wmi.exports.on_event(cb_id); })
+            .catch(() => { window.__fetchCache.status = 0; window.__fetchCache.body = ''; if (wmi?.exports?.on_event) wmi.exports.on_event(cb_id); });
+        },
+        js_fetch_post_json: (url_ptr, url_len, body_ptr, body_len, cb_id) => {
+          const url = s(url_ptr, url_len);
+          const body = s(body_ptr, body_len);
+          if (!window.__fetchCache) window.__fetchCache = { status: 0, body: '' };
+          const headers = { 'content-type': 'application/json' };
+          if (window.__authToken) headers['authorization'] = `Bearer ${window.__authToken}`;
+          fetch(url, { method: 'POST', headers, body })
+            .then(r => (window.__fetchCache.status = r.status, r.text()))
+            .then(t => { window.__fetchCache.body = t; if (wmi?.exports?.on_event) wmi.exports.on_event(cb_id); })
+            .catch(() => { window.__fetchCache.status = 0; window.__fetchCache.body = ''; if (wmi?.exports?.on_event) wmi.exports.on_event(cb_id); });
+        },
+        js_get_fetch_body: (dst_ptr, dst_len) => {
+          const txt = (window.__fetchCache && window.__fetchCache.body) || '';
+          return wmi.storeString(dst_ptr, txt.slice(0, dst_len));
+        },
+        js_get_fetch_status: () => (window.__fetchCache && window.__fetchCache.status) || 0,
+        js_set_auth_token: (tok_ptr, tok_len) => {
+          window.__authToken = s(tok_ptr, tok_len);
+        },
       }
     };
 

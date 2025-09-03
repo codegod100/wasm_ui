@@ -11,6 +11,7 @@ draft_buf: [1024]u8
 fetch_buf: [16384]u8
 
 Server_Message :: struct { user: string, text: string, at: string }
+Token_Response :: struct { token: string }
 
 get_input_text :: proc() -> string {
     // Fetch value of the input with id="chat-input" from JS into draft_buf
@@ -145,12 +146,28 @@ on_post_done :: proc() {
     js_fetch_get("/api/messages", 10)
 }
 
+on_token_fetched :: proc() {
+    n := js_get_fetch_body(&fetch_buf[0], i32(len(fetch_buf)))
+    total := int(n)
+    if total <= 0 { return }
+    s := string(fetch_buf[:total])
+    tr: Token_Response
+    if err := json.unmarshal_string(s, &tr); err != nil || len(tr.token) == 0 {
+        append_message(fmt.tprintf("Auth token error: %v, body: %s", err, s[:min(total, 120)]))
+        return
+    }
+    js_set_auth_token(tr.token)
+    // now fetch messages with auth
+    js_fetch_get("/api/messages", 10)
+}
+
 main :: proc() {
     register_handler(1, on_send)
     register_handler(3, on_clear)
     register_handler(10, on_messages_fetched)
     register_handler(11, on_post_done)
+    register_handler(20, on_token_fetched)
     mount("#app", App)
-    // Initial load
-    js_fetch_get("/api/messages", 10)
+    // Get JWT then load messages
+    js_fetch_get("/api/auth/token?sub=You", 20)
 }

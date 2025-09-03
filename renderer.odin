@@ -18,6 +18,12 @@ foreign js {
     js_set_value_by_id  :: proc(id, value: string) ---
     js_focus_by_id      :: proc(id: string) ---
     js_scroll_to_bottom_by_id :: proc(id: string) ---
+    // Simple fetch bridge
+    js_fetch_get        :: proc(url: string, cb_id: u32) ---
+    js_fetch_post_json  :: proc(url, body: string, cb_id: u32) ---
+    js_get_fetch_body   :: proc(dst: ^u8, dst_len: i32) -> i32 ---
+    js_get_fetch_status :: proc() -> i32 ---
+    js_set_auth_token   :: proc(token: string) ---
 }
 
 root_el: u32
