@@ -2,11 +2,15 @@ package main
 
 import "core:fmt"
 import "core:strings"
+import json "core:encoding/json"
 
 // Simple global state for the demo
 // Chat state
 messages: [dynamic]string
 draft_buf: [1024]u8
+fetch_buf: [16384]u8
+
+Server_Message :: struct { user: string, text: string, at: string }
 
 get_input_text :: proc() -> string {
     // Fetch value of the input with id="chat-input" from JS into draft_buf
@@ -25,12 +29,16 @@ append_message :: proc(msg: string) {
 on_send :: proc() {
     text := strings.trim_space(get_input_text())
     if len(text) == 0 { return }
-    append_message(fmt.tprintf("You: %s", text))
-    // simple bot echo
-    reply := fmt.tprintf("Bot: You said '%s'", text)
-    append_message(reply)
-    // clear the input field in the DOM
+    // clear input
     js_set_value_by_id("chat-input", "")
+    // POST to backend; on completion event 11 will fire
+    body := struct{ user: string, text: string }{"You", text}
+    data, merr := json.marshal(body)
+    if merr != nil {
+        append_message("Error: could not encode message")
+        return
+    }
+    js_fetch_post_json("/api/messages", string(data), 11)
 }
 
 on_clear :: proc() {
@@ -55,6 +63,12 @@ App :: proc() -> Node {
     input_props["id"] = "chat-input"
     input_props["type"] = "text"
     input_props["placeholder"] = "Type a message..."
+    // Disable browser autocomplete and helpers
+    input_props["autocomplete"] = "off"
+    input_props["autocorrect"] = "off"
+    input_props["autocapitalize"] = "off"
+    input_props["spellcheck"] = "false"
+    input_props["enterkeyhint"] = "send"
     // Enter to send
     input_props["on:enter"] = "1"
 
@@ -92,8 +106,51 @@ App :: proc() -> Node {
     )
 }
 
+// Fetch handlers
+on_messages_fetched :: proc() {
+    status := js_get_fetch_status()
+    n := js_get_fetch_body(&fetch_buf[0], i32(len(fetch_buf)))
+    total := int(n)
+    if total < 0 { total = 0 }
+    if total > len(fetch_buf) { total = len(fetch_buf) }
+    s := string(fetch_buf[:total])
+
+    if status != 200 || total <= 0 {
+        // Log status and a small body preview to help debugging
+        prev_len := total
+        if prev_len > 200 { prev_len = 200 }
+        preview := s[:prev_len]
+        append_message(fmt.tprintf("Fetch /api/messages failed (status %v): %s", status, preview))
+        return
+    }
+
+    // Parse JSON array of Server_Message
+    arr: []Server_Message
+    if uerr := json.unmarshal_string(s, &arr); uerr != nil {
+        prev_len := len(s)
+        if prev_len > 200 { prev_len = 200 }
+        preview := s[:prev_len]
+        append_message(fmt.tprintf("Error: bad JSON from /api/messages (%v). Body preview: %s", uerr, preview))
+        return
+    }
+    // Rebuild messages from server
+    messages = nil
+    for m in arr {
+        append_message(fmt.tprintf("%s: %s", m.user, m.text))
+    }
+}
+
+on_post_done :: proc() {
+    // After posting, refresh messages
+    js_fetch_get("/api/messages", 10)
+}
+
 main :: proc() {
     register_handler(1, on_send)
     register_handler(3, on_clear)
+    register_handler(10, on_messages_fetched)
+    register_handler(11, on_post_done)
     mount("#app", App)
+    // Initial load
+    js_fetch_get("/api/messages", 10)
 }
