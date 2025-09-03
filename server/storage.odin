@@ -13,6 +13,7 @@ import "core:strings"
 
 // Minimal HTTPS via OpenSSL (vendored)
 import openssl "local:odin-http/openssl"
+import runtime "base:runtime"
 
 // Message model shared by server
 Message :: struct { user: string, text: string, at: string }
@@ -34,6 +35,22 @@ storage_last_status: int
 storage_last_sql: string
 storage_last_rows: int
 storage_last_body_preview: string
+
+// -----------------------
+// Passkey (WebAuthn) models
+// -----------------------
+User :: struct { id: string, username: string }
+Credential :: struct { id: string, user_id: string, public_key: string, alg: int, sign_count: int, transports: string, created_at: int }
+
+// Helper: random bytes -> base64url string
+rand_b64url :: proc(n: int, allocator := context.temp_allocator) -> (out: string, ok: bool) {
+    if n <= 0 { return "", false }
+    buf := make([]byte, n, allocator)
+    // Fill with pseudo-random bytes (sufficient for demo; replace with OS entropy for production)
+    rg := runtime.default_random_generator()
+    if !runtime.random_generator_read_bytes(rg, buf) { return "", false }
+    return base64url_encode(buf, allocator), true
+}
 
 // Minimal request/response structs for Turso API
 Turso_Result :: struct {
@@ -132,6 +149,10 @@ https_post_json :: proc(target_url: string, bearer_token: string, json_body: str
     strings.write_string(&req, "authorization: Bearer ")
     strings.write_string(&req, bearer_token)
     strings.write_string(&req, "\r\n")
+    // Prefer strong read-after-write consistency to avoid replica lag on immediate reads
+    // Headers are ignored by servers that don't recognize them
+    strings.write_string(&req, "x-turso-consistency: strong\r\n")
+    strings.write_string(&req, "x-libsql-consistency: strong\r\n")
     strings.write_string(&req, "content-type: application/json\r\n")
     strings.write_string(&req, "content-length: ")
     lbuf: [32]u8
@@ -365,9 +386,27 @@ turso_execute :: proc(sql: string, allocator := context.temp_allocator) -> (Turs
 
 // Create messages table if needed
 turso_ensure_schema :: proc(allocator := context.temp_allocator) -> bool {
-    _, ok := turso_execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, user TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL)", allocator)
-    if !ok && len(storage_last_error) == 0 { storage_last_error = "schema ensure failed" }
-    return ok
+    // messages
+    if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, user TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL)", allocator); !ok {
+        if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (messages)" }
+        return false
+    }
+    // users
+    if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE)", allocator); !ok {
+        if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (users)" }
+        return false
+    }
+    // webauthn credentials
+    if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS webauthn_credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, public_key TEXT NOT NULL, alg INTEGER NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0, transports TEXT, created_at INTEGER NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)", allocator); !ok {
+        if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (webauthn_credentials)" }
+        return false
+    }
+    // webauthn challenges
+    if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS webauthn_challenges (challenge TEXT PRIMARY KEY, user_id TEXT NOT NULL, type TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)", allocator); !ok {
+        if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (webauthn_challenges)" }
+        return false
+    }
+    return true
 }
 
 // Public API: configure Turso at runtime
@@ -501,4 +540,134 @@ storage_status :: proc() -> struct {
         last_rows: int,
         last_body_preview: string,
     }{ turso_enabled, turso_schema_attempted, turso_schema_ready, turso_url, storage_last_error, storage_last_status, storage_last_sql, storage_last_rows, storage_last_body_preview }
+}
+
+// -----------------------
+// Passkey storage helpers
+// -----------------------
+
+// Ensure schema lazily like messages facade
+ensure_schema_if_needed :: proc() {
+    if !turso_schema_attempted { turso_schema_attempted = true; turso_schema_ready = turso_ensure_schema() }
+}
+
+get_or_create_user :: proc(username: string, allocator := context.temp_allocator) -> (u: User, ok: bool) {
+    if !turso_enabled { return User{}, false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return User{}, false }
+    uname := sql_quote(username, allocator)
+    // Try fetch existing
+    q := fmt.tprintf("SELECT id, username FROM users WHERE username = %s LIMIT 1", uname)
+    res, rok := turso_execute(q, allocator)
+    if rok && len(res.rows) > 0 {
+        r := res.rows[0]
+        if len(r) >= 2 { return User{ id = r[0], username = r[1] }, true }
+    }
+    // Create new
+    id, okr := rand_b64url(16, allocator)
+    if !okr { return User{}, false }
+    idq := sql_quote(id, allocator)
+    ins := fmt.tprintf("INSERT INTO users(id, username) VALUES (%s, %s)", idq, uname)
+    if _, iok := turso_execute(ins, allocator); !iok { return User{}, false }
+    return User{ id = id, username = username }, true
+}
+
+list_credentials_for_user :: proc(user_id: string, allocator := context.temp_allocator) -> ([]Credential, bool) {
+    if !turso_enabled { return nil, false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return nil, false }
+    uid := sql_quote(user_id, allocator)
+    q := fmt.tprintf("SELECT id, user_id, public_key, alg, sign_count, IFNULL(transports,''), created_at FROM webauthn_credentials WHERE user_id = %s", uid)
+    res, ok := turso_execute(q, allocator)
+    if !ok { return nil, false }
+    out, _ := make([dynamic]Credential, 0, len(res.rows))
+    for r in res.rows {
+        if len(r) < 7 { continue }
+        algv, _ := strconv.parse_int(r[3], 10)
+        scv, _ := strconv.parse_int(r[4], 10)
+        cav, _ := strconv.parse_int(r[6], 10)
+        _, _ = append(&out, Credential{ id = r[0], user_id = r[1], public_key = r[2], alg = algv, sign_count = scv, transports = r[5], created_at = cav })
+    }
+    return out[:], true
+}
+
+insert_challenge :: proc(user_id: string, kind: string, challenge: string, ttl_seconds: int = 300, allocator := context.temp_allocator) -> bool {
+    if !turso_enabled { return false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return false }
+    uid := sql_quote(user_id, allocator)
+    ch := sql_quote(challenge, allocator)
+    k := sql_quote(kind, allocator)
+    // created_at = unix seconds, expires_at = +ttl
+    // Use '%%s' inside strftime format to avoid fmt interpreting '%s'
+    ins := fmt.tprintf("INSERT OR REPLACE INTO webauthn_challenges(challenge, user_id, type, created_at, expires_at) VALUES (%s, %s, %s, CAST(strftime('%%s','now') AS INTEGER), CAST(strftime('%%s','now') AS INTEGER)+%d)", ch, uid, k, ttl_seconds)
+    _, ok := turso_execute(ins, allocator)
+    if !ok {
+        log.warnf("turso insert_challenge failed: status=%v err=%s sql=%s", storage_last_status, storage_last_error, storage_last_sql)
+    } else {
+        log.infof("turso insert_challenge ok: status=%v sql=%s", storage_last_status, storage_last_sql)
+    }
+    return ok
+}
+
+get_challenge :: proc(challenge: string, kind: string, allocator := context.temp_allocator) -> (user_id: string, created_at: int, expires_at: int, ok: bool) {
+    if !turso_enabled { return "", 0, 0, false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return "", 0, 0, false }
+    ch := sql_quote(challenge, allocator)
+    k := sql_quote(kind, allocator)
+    q := fmt.tprintf("SELECT user_id, created_at, expires_at FROM webauthn_challenges WHERE challenge = %s AND type = %s LIMIT 1", ch, k)
+    res, okq := turso_execute(q, allocator)
+    if !okq || len(res.rows) == 0 { return "", 0, 0, false }
+    r := res.rows[0]
+    if len(r) < 3 { return "", 0, 0, false }
+    ca, _ := strconv.parse_int(r[1], 10)
+    ea, _ := strconv.parse_int(r[2], 10)
+    return r[0], ca, ea, true
+}
+
+delete_challenge :: proc(challenge: string, allocator := context.temp_allocator) -> bool {
+    if !turso_enabled { return false }
+    ch := sql_quote(challenge, allocator)
+    q := fmt.tprintf("DELETE FROM webauthn_challenges WHERE challenge = %s", ch)
+    _, ok := turso_execute(q, allocator)
+    return ok
+}
+
+insert_credential :: proc(cred: Credential, allocator := context.temp_allocator) -> bool {
+    if !turso_enabled { return false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return false }
+    id := sql_quote(cred.id, allocator)
+    uid := sql_quote(cred.user_id, allocator)
+    pk := sql_quote(cred.public_key, allocator)
+    tr := sql_quote(cred.transports, allocator)
+    // Escape '%s' in strftime for fmt
+    sql := fmt.tprintf("INSERT OR REPLACE INTO webauthn_credentials(id, user_id, public_key, alg, sign_count, transports, created_at) VALUES (%s,%s,%s,%d,%d,%s,CAST(strftime('%%s','now') AS INTEGER))", id, uid, pk, cred.alg, cred.sign_count, tr)
+    _, ok := turso_execute(sql, allocator)
+    return ok
+}
+
+get_credential_by_id :: proc(id_b64: string, allocator := context.temp_allocator) -> (cred: Credential, ok: bool) {
+    if !turso_enabled { return Credential{}, false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return Credential{}, false }
+    id := sql_quote(id_b64, allocator)
+    q := fmt.tprintf("SELECT id, user_id, public_key, alg, sign_count, IFNULL(transports,''), created_at FROM webauthn_credentials WHERE id = %s LIMIT 1", id)
+    res, rok := turso_execute(q, allocator)
+    if !rok || len(res.rows) == 0 { return Credential{}, false }
+    r := res.rows[0]
+    if len(r) < 7 { return Credential{}, false }
+    algv, _ := strconv.parse_int(r[3], 10)
+    scv, _ := strconv.parse_int(r[4], 10)
+    cav, _ := strconv.parse_int(r[6], 10)
+    return Credential{ id = r[0], user_id = r[1], public_key = r[2], alg = algv, sign_count = scv, transports = r[5], created_at = cav }, true
+}
+
+update_credential_sign_count :: proc(id_b64: string, new_count: int, allocator := context.temp_allocator) -> bool {
+    if !turso_enabled { return false }
+    id := sql_quote(id_b64, allocator)
+    sql := fmt.tprintf("UPDATE webauthn_credentials SET sign_count = %d WHERE id = %s", new_count, id)
+    _, ok := turso_execute(sql, allocator)
+    return ok
 }

@@ -132,6 +132,10 @@
         <span>Loading UI…</span>
       </div>
     </div>
+    <div style="margin-top:16px; padding-top:8px; border-top:1px solid #eee;">
+      <button id="btn-passkey-register">Register Passkey</button>
+      <button id="btn-passkey-login">Sign in with Passkey</button>
+    </div>
     <script>
       // Basic styling hooks used by the Odin side
       const styleObserver = new MutationObserver(() => {
@@ -145,6 +149,122 @@
         if (actions) actions.classList.add('chat-actions');
       });
       styleObserver.observe(document.getElementById('app'), { childList: true, subtree: true });
+    </script>
+    <script>
+      // Minimal helpers for base64url <-> ArrayBuffer
+      const b64uToBytes = (s) => {
+        s = s.replace(/-/g, '+').replace(/_/g, '/');
+        // pad
+        while (s.length % 4) s += '=';
+        const bin = atob(s);
+        const u8 = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+        return u8;
+      };
+      const bytesToB64u = (u8) => {
+        let s = '';
+        for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+        return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/,'');
+      };
+
+      // Map server JSON into WebAuthn options
+      const toCreationOptions = (opts) => ({
+        rp: opts.rp,
+        user: {
+          id: b64uToBytes(opts.user.id_b64),
+          name: opts.user.name,
+          displayName: opts.user.displayName,
+        },
+        challenge: b64uToBytes(opts.challenge_b64),
+        pubKeyCredParams: opts.pubKeyCredParams,
+        timeout: opts.timeout,
+        attestation: opts.attestation,
+        excludeCredentials: (opts.excludeCredentials||[]).map(e => ({ type: e.type, id: b64uToBytes(e.id_b64) })),
+      });
+
+      const toRequestOptions = (opts) => ({
+        challenge: b64uToBytes(opts.challenge_b64),
+        timeout: opts.timeout,
+        userVerification: opts.userVerification,
+        allowCredentials: (opts.allowCredentials||[]).map(a => ({ type: a.type, id: b64uToBytes(a.id_b64), transports: (a.transports||'').split(',').filter(Boolean) })),
+      });
+
+      const postJson = async (url, body) => {
+        const r = await fetch(url, { method: 'POST', headers: { 'content-type':'application/json' }, body: JSON.stringify(body) });
+        const text = await r.text();
+        if (!text) {
+          if (!r.ok) throw new Error(`HTTP ${r.status} empty body`);
+          return {};
+        }
+        try {
+          const json = JSON.parse(text);
+          if (!r.ok) throw new Error(json && json.error ? json.error : `HTTP ${r.status}`);
+          return json;
+        } catch (e) {
+          if (!r.ok) throw new Error(`HTTP ${r.status} ${text.slice(0,160)}`);
+          throw e;
+        }
+      };
+
+      const onRegisterClick = async () => {
+        const username = prompt('Username for passkey registration:')?.trim();
+        if (!username) return;
+        try {
+          const start = await postJson('/api/auth/passkey/register/start', { username });
+          const cred = await navigator.credentials.create({ publicKey: toCreationOptions(start) });
+          if (!cred) throw new Error('no credential created');
+          const att = cred.response;
+          const payload = {
+            username,
+            id_b64: cred.id,
+            raw_id_b64: bytesToB64u(new Uint8Array(cred.rawId)),
+            type: cred.type,
+            response: {
+              attestationObject_b64: bytesToB64u(new Uint8Array(att.attestationObject)),
+              clientDataJSON_b64: bytesToB64u(new Uint8Array(att.clientDataJSON)),
+            }
+          };
+          const fin = await postJson('/api/auth/passkey/register/finish', payload);
+          console.log('register finish', fin);
+          alert('Passkey registration: ' + (fin && fin.error ? fin.error : 'done'));
+        } catch (e) {
+          console.error('register error', e);
+          alert('Register failed: ' + e);
+        }
+      };
+
+      const onLoginClick = async () => {
+        const username = prompt('Username for passkey sign-in:')?.trim();
+        if (!username) return;
+        try {
+          const start = await postJson('/api/auth/passkey/login/start', { username });
+          if (start && start.error) { alert('No credentials for user'); return; }
+          const assertion = await navigator.credentials.get({ publicKey: toRequestOptions(start) });
+          if (!assertion) throw new Error('no assertion');
+          const res = assertion.response;
+          const payload = {
+            username,
+            id_b64: assertion.id,
+            raw_id_b64: bytesToB64u(new Uint8Array(assertion.rawId)),
+            type: assertion.type,
+            response: {
+              authenticatorData_b64: bytesToB64u(new Uint8Array(res.authenticatorData)),
+              clientDataJSON_b64: bytesToB64u(new Uint8Array(res.clientDataJSON)),
+              signature_b64: bytesToB64u(new Uint8Array(res.signature)),
+              userHandle_b64: res.userHandle ? bytesToB64u(new Uint8Array(res.userHandle)) : ''
+            }
+          };
+          const fin = await postJson('/api/auth/passkey/login/finish', payload);
+          console.log('login finish', fin);
+          alert('Passkey login: ' + (fin && fin.error ? fin.error : 'done'));
+        } catch (e) {
+          console.error('login error', e);
+          alert('Login failed: ' + e);
+        }
+      };
+
+      document.getElementById('btn-passkey-register').addEventListener('click', onRegisterClick);
+      document.getElementById('btn-passkey-login').addEventListener('click', onLoginClick);
     </script>
     
   </body>

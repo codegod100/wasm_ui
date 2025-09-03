@@ -33,14 +33,19 @@ base64url_decode :: proc(s: string, allocator := context.allocator) -> (out: []b
         padding += 1
     }
     tmp := make([]byte, size, context.temp_allocator)
+    // Copy input
     copy(tmp, transmute([]byte) s)
+    // Translate URL alphabet to standard
     for ch, i in tmp {
         switch ch {
         case '-': tmp[i] = '+'
         case '_': tmp[i] = '/'
         }
     }
-    for _ in 0..<(padding) { tmp[len(tmp)-1] = '=' }
+    // Pad with '=' at the end as needed
+    for k in 0..<padding {
+        tmp[len(tmp)-1-k] = '='
+    }
     dec, err := base64.decode(string(tmp), base64.DEC_TABLE, allocator)
     if err != nil { return nil, false }
     return dec, true
