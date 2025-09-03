@@ -20,7 +20,6 @@ node_modules/
 
 # Odin WASM build outputs
 *.wasm
-odin.js
 
 # Local server binary
 server_bin

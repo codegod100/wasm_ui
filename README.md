@@ -51,7 +51,7 @@ Without just:
 ## File Overview
 
 - `index.html` — Boots the WASM, provides DOM/JS bridge and loading spinner
-- `odin.js` — Odin’s JS runtime/loader required by `index.html` (not tracked; copied at build if missing)
+- `odin.js` — Odin’s JS runtime/loader required by `index.html` (tracked in repo)
 - `main.odin` — UI state + components; fetch handlers, JWT wiring
 - `vdom.odin` — Minimal virtual DOM node definitions
 - `renderer.odin` — DOM builder + JS foreign imports (events, fetch, focus)
@@ -70,7 +70,7 @@ Without just:
 
 - If the server can’t find `odin-http`, run `just vendor`.
 - If the browser fetches fail, check DevTools Network and the terminal logs. The UI logs status and up to 200 chars of body on parse failures.
-- If you see a 404 for `odin.js`, run `just build` (it will attempt to copy it). You can set `ODIN_JS_PATH` to point to your local Odin `odin.js`.
+- If you see a 404 for `odin.js`, ensure it’s present in the project root (it’s tracked in this example); the page loads it before starting `ui.wasm`.
 
 ---
 This is an educational example; harden and review before production use.

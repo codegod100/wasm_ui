@@ -7,23 +7,8 @@ out := "ui.wasm"
 # Default task
 default: build
 
-# Ensure `odin.js` is present (copy if needed)
-ensure-odin-js:
-	@if [ -f odin.js ]; then \
-		echo "odin.js present"; \
-	elif [ -n "${ODIN_JS_PATH:-}" ] && [ -f "$ODIN_JS_PATH" ]; then \
-		cp "$ODIN_JS_PATH" ./odin.js; \
-		echo "Copied odin.js from ODIN_JS_PATH"; \
-	elif [ -f ../wasm_hello/odin.js ]; then \
-		cp ../wasm_hello/odin.js ./odin.js; \
-		echo "Copied odin.js from ../wasm_hello"; \
-	else \
-		echo "Missing odin.js. Set ODIN_JS_PATH to the path of Odin's odin.js or copy it here." >&2; \
-		exit 1; \
-	fi
-
 # Build the WASM module
-build: ensure-odin-js
+build:
 	odin build . -target:{{target}} -out:./{{out}}
 
 # Build the native server (requires odin-http in vendor/)
