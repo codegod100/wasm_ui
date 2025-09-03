@@ -22,3 +22,8 @@ node_modules/
 *.wasm
 odin.js
 
+# Local server binary
+server_bin
+
+# Vendored third-party sources (cloned locally, not tracked)
+vendor/odin-http/
