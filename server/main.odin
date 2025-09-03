@@ -196,6 +196,7 @@ main :: proc() {
         chall, okc := rand_b64url(32)
         if !okc { http.respond_json(res, struct{ error: string }{"challenge generation failed"}, http.Status.Internal_Server_Error); return }
         if !insert_challenge_any("auth", chall) {
+            log.warnf("conditional/start: insert challenge failed; status=%v err=%s sql=%s", storage_last_status, storage_last_error, storage_last_sql)
             http.respond_json(res, struct{ error: string }{"failed to save challenge"}, http.Status.Internal_Server_Error)
             return
         }
@@ -457,7 +458,14 @@ main :: proc() {
             // Consume challenge
             if used_any { _ = delete_challenge_any(ch_norm) } else { _ = delete_challenge(ch_norm) }
 
-            http.respond_json(res, struct{ status: string }{"ok"})
+            // Issue JWT for this user for subsequent authorized actions
+            now := time.now()
+            sbuf_j: [32]u8
+            iat := strconv.itoa(sbuf_j[:], int(time.to_unix_seconds(now)))
+            pr := JWT_Payload{ sub = user.username, iat = iat }
+            pjson, _ := json.marshal(pr)
+            tok := jwt_sign_hs256(string(pjson), transmute([]byte) jwt_secret, context.temp_allocator)
+            http.respond_json(res, struct{ status: string, username: string, token: string }{"ok", user.username, tok})
         })
     }))
     http.route_get(&router, "/api/health", http.handler(proc(_: ^http.Request, res: ^http.Response) {
@@ -486,28 +494,42 @@ main :: proc() {
     }))
 
     http.route_post(&router, "/api/messages", http.handler(proc(req: ^http.Request, res: ^http.Response) {
-        http.body(req, 8<<20, res, proc(rp: rawptr, body: http.Body, berr: http.Body_Error) {
-            res := cast(^http.Response)rp
-            if berr != nil {
-                http.respond(res, http.body_error_status(berr))
-                return
+        // Extract Authorization header upfront
+        auth_header := ""
+        if h, ok := http.headers_get_unsafe(req.headers, "authorization"); ok { auth_header = h }
+        // Context passed to body callback
+        MsgCtx :: struct { res: ^http.Response, auth: string }
+        mctx := MsgCtx{ res, auth_header }
+        http.body(req, 8<<20, transmute(rawptr)&mctx, proc(rp: rawptr, body: http.Body, berr: http.Body_Error) {
+            ctx := cast(^MsgCtx)rp
+            res := ctx.res
+            if berr != nil { http.respond(res, http.body_error_status(berr)); return }
+            // Require Bearer token
+            if len(ctx.auth) == 0 || !strings.has_prefix(ctx.auth, "Bearer ") { http.respond(res, http.Status.Unauthorized); return }
+            token := strings.trim_prefix(ctx.auth, "Bearer ")
+            okv, payload := jwt_verify_hs256(token, transmute([]byte) jwt_secret, context.temp_allocator)
+            if !okv { http.respond(res, http.Status.Unauthorized); return }
+            // Extract username from payload
+            pl: JWT_Payload
+            if json.unmarshal_string(payload, &pl) != nil || len(strings.trim_space(pl.sub)) == 0 { http.respond(res, http.Status.Unauthorized); return }
+            // Body: prefer { text }, fallback to legacy { user, text }
+            BNow := struct{ text: string }{""}
+            text := ""
+            if json.unmarshal_string(body, &BNow) == nil && len(strings.trim_space(BNow.text)) > 0 {
+                text = strings.trim_space(BNow.text)
+            } else {
+                legacy := struct{ user: string, text: string }{"",""}
+                if json.unmarshal_string(body, &legacy) != nil || len(strings.trim_space(legacy.text)) == 0 { http.respond(res, http.Status.Bad_Request); return }
+                text = strings.trim_space(legacy.text)
             }
-            // Parse JSON
-            pb: PostBody
-            if jerr := json.unmarshal_string(body, &pb); jerr != nil || len(pb.text) == 0 {
-                http.respond(res, http.Status.Bad_Request)
-                return
-            }
-            n := time.now()
-            // Use unix seconds as ASCII and clone into long-lived allocator
-            sec := time.to_unix_seconds(n)
+            // Resolve user id
+            u, uok := get_or_create_user(strings.trim_space(pl.sub))
+            if !uok { http.respond(res, http.Status.Internal_Server_Error); return }
+            // Timestamp
+            sec := time.to_unix_seconds(time.now())
             sbuf: [32]u8
-            sec_str := strconv.itoa(sbuf[:], int(sec))
-            at := strings.clone(sec_str, context.allocator)
-            if ok := add_message(Message{ user = pb.user, text = pb.text, at = at }); !ok {
-                http.respond(res, http.Status.Internal_Server_Error)
-                return
-            }
+            at := strconv.itoa(sbuf[:], int(sec))
+            if ok := add_message_for_user(u.id, text, at); !ok { http.respond(res, http.Status.Internal_Server_Error); return }
             http.respond_json(res, struct{ status: string }{"ok"}, .Created)
         })
     }))

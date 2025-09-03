@@ -110,6 +110,14 @@
         js_set_auth_token: (tok_ptr, tok_len) => {
           window.__authToken = s(tok_ptr, tok_len);
         },
+        js_has_auth_token: () => !!window.__authToken,
+        js_set_current_user: (name_ptr, name_len) => {
+          window.__currentUser = s(name_ptr, name_len);
+        },
+        js_get_current_user: (dst_ptr, dst_len) => {
+          const name = window.__currentUser || '';
+          return wmi.storeString(dst_ptr, name.slice(0, dst_len));
+        },
       }
     };
 
@@ -273,6 +281,12 @@
           };
           const fin = await postJson('/api/auth/passkey/login/finish', payload);
           console.log('login finish (usernameless)', fin);
+          if (fin && fin.username) {
+            // push to WASM and trigger UI update
+            window.__currentUser = fin.username;
+            if (fin.token) window.__authToken = fin.token;
+            if (wmi?.exports?.on_event) wmi.exports.on_event(60);
+          }
           alert('Passkey login: ' + (fin && fin.error ? fin.error : 'done'));
         } catch (e) {
           console.error('usernameless login error', e);

@@ -15,7 +15,7 @@ import "core:strings"
 import openssl "local:odin-http/openssl"
 import runtime "base:runtime"
 
-// Message model shared by server
+// Message model returned by API (user = username)
 Message :: struct { user: string, text: string, at: string }
 
 // Result window for queries
@@ -30,6 +30,7 @@ turso_token: string
 // Lazily ensure schema to avoid blocking startup when env vars are present.
 turso_schema_attempted: bool
 turso_schema_ready: bool
+messages_migration_pending: bool
 storage_last_error: string
 storage_last_status: int
 storage_last_sql: string
@@ -385,16 +386,31 @@ turso_execute :: proc(sql: string, allocator := context.temp_allocator) -> (Turs
 }
 
 // Create messages table if needed
+// Ensure base schema (no intrusive migrations). Messages migration, if needed, occurs lazily.
 turso_ensure_schema :: proc(allocator := context.temp_allocator) -> bool {
-    // messages
-    if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, user TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL)", allocator); !ok {
-        if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (messages)" }
-        return false
-    }
     // users
     if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE)", allocator); !ok {
         if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (users)" }
         return false
+    }
+    // messages: detect presence and columns; create if missing (new schema)
+    // Check if table exists and whether it needs migration
+    info, okti := turso_execute("PRAGMA table_info(messages)", allocator)
+    if !okti {
+        // If PRAGMA unsupported, optimistically continue; other tables can still work
+        log.warnf("schema: pragma table_info(messages) failed; skipping messages check; status=%v err=%s sql=%s", storage_last_status, storage_last_error, storage_last_sql)
+    } else {
+        if len(info.rows) == 0 {
+            // Create new schema
+            if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)", allocator); !ok {
+                if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (messages create)" }
+                return false
+            }
+        } else {
+            has_user := false; has_user_id := false
+            for r in info.rows { if len(r) >= 2 { if r[1] == "user" { has_user = true } ; if r[1] == "user_id" { has_user_id = true } } }
+            if has_user && !has_user_id { messages_migration_pending = true }
+        }
     }
     // webauthn credentials
     if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS webauthn_credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, public_key TEXT NOT NULL, alg INTEGER NOT NULL, sign_count INTEGER NOT NULL DEFAULT 0, transports TEXT, created_at INTEGER NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)", allocator); !ok {
@@ -411,6 +427,34 @@ turso_ensure_schema :: proc(allocator := context.temp_allocator) -> bool {
         if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (webauthn_challenges_any)" }
         return false
     }
+    return true
+}
+
+// Perform messages schema migration (old 'user' -> 'user_id') lazily
+migrate_messages_schema :: proc(allocator := context.temp_allocator) -> bool {
+    // Verify need
+    info, ok := turso_execute("PRAGMA table_info(messages)", allocator)
+    if !ok { return false }
+    has_user := false; has_user_id := false
+    for r in info.rows { if len(r) >= 2 { if r[1] == "user" { has_user = true } ; if r[1] == "user_id" { has_user_id = true } } }
+    if !(has_user && !has_user_id) { messages_migration_pending = false; return true }
+    if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS messages_new (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)", allocator); !ok { return false }
+    rows, okr := turso_execute("SELECT id, user, text, at FROM messages ORDER BY id ASC", allocator)
+    if !okr { return false }
+    for r in rows.rows {
+        if len(r) < 4 { continue }
+        id := r[0]; username := r[1]; text := r[2]; at := r[3]
+        u, uok := get_or_create_user(username, allocator)
+        if !uok { return false }
+        idq := sql_quote(id, allocator)
+        uidq := sql_quote(u.id, allocator)
+        tq := sql_quote(text, allocator)
+        ins := fmt.tprintf("INSERT OR REPLACE INTO messages_new(id, user_id, text, at) VALUES (%s,%s,%s,%s)", idq, uidq, tq, at)
+        if _, ok := turso_execute(ins, allocator); !ok { return false }
+    }
+    if _, ok := turso_execute("DROP TABLE messages", allocator); !ok { return false }
+    if _, ok := turso_execute("ALTER TABLE messages_new RENAME TO messages", allocator); !ok { return false }
+    messages_migration_pending = false
     return true
 }
 
@@ -447,24 +491,21 @@ set_turso_config :: proc(url: string, token: string) -> bool {
 }
 
 // Turso-backed add/get
-turso_add_message :: proc(m: Message, allocator := context.temp_allocator) -> bool {
-    // Use args as strings to avoid type issues; SQLite coerces where applicable.
-    // Embed values directly (escaped): INSERT INTO messages(user, text, at) VALUES ('user','text', at)
-    u := sql_quote(m.user, allocator)
-    t := sql_quote(m.text, allocator)
-    sql := fmt.tprintf("INSERT INTO messages(user, text, at) VALUES (%s, %s, %s)", u, t, m.at)
+// Insert message for user_id
+turso_add_message_for_user :: proc(user_id: string, text: string, at: string, allocator := context.temp_allocator) -> bool {
+    uid := sql_quote(user_id, allocator)
+    t := sql_quote(text, allocator)
+    sql := fmt.tprintf("INSERT INTO messages(user_id, text, at) VALUES (%s, %s, %s)", uid, t, at)
     _, ok := turso_execute(sql, allocator)
     return ok
 }
 
+// Return latest messages joined with usernames
 turso_get_messages :: proc(limit: int = max_messages, allocator := context.temp_allocator) -> ([]Message, bool) {
-    // Cast numeric columns to text so JSON rows decode as strings consistently.
-    q_base := "SELECT CAST(id AS TEXT), user, text, CAST(at AS TEXT) FROM messages ORDER BY id ASC LIMIT ?1"
     sbuf: [32]u8
     lstr := strconv.itoa(sbuf[:], limit)
-    // Embed limit directly (integer)
-    q := fmt.tprintf("SELECT CAST(id AS TEXT), user, text, CAST(at AS TEXT) FROM messages ORDER BY id ASC LIMIT %s", lstr)
-    _ = q_base // silence unused
+    q := fmt.tprintf("SELECT u.username, m.text, CAST(m.at AS TEXT) FROM messages m JOIN users u ON u.id = m.user_id ORDER BY m.id ASC LIMIT %s", lstr)
+    if messages_migration_pending { _ = migrate_messages_schema(context.temp_allocator) }
     resp, ok := turso_execute(q, allocator)
     if !ok {
         return nil, false
@@ -473,9 +514,9 @@ turso_get_messages :: proc(limit: int = max_messages, allocator := context.temp_
     rows := resp.rows
     out, _ := make([dynamic]Message, 0, len(rows))
     for r in rows {
-        if len(r) < 4 { continue }
-        // r = [id_text, user, text, at_text]
-        _, _ = append(&out, Message{ user = r[1], text = r[2], at = r[3] })
+        if len(r) < 3 { continue }
+        // r = [username, text, at_text]
+        _, _ = append(&out, Message{ user = r[0], text = r[1], at = r[2] })
     }
     return out[:], true
 }
@@ -511,10 +552,11 @@ storage_init :: proc() {
     }
 }
 
-add_message :: proc(m: Message) -> bool {
+add_message_for_user :: proc(user_id: string, text: string, at: string) -> bool {
     if !turso_enabled { return false }
     if !turso_schema_attempted { turso_schema_attempted = true; turso_schema_ready = turso_ensure_schema() }
-    return turso_add_message(m)
+    if messages_migration_pending { _ = migrate_messages_schema(context.temp_allocator) }
+    return turso_add_message_for_user(user_id, text, at)
 }
 
 get_messages :: proc() -> (out: []Message, ok: bool) {

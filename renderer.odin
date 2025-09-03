@@ -24,6 +24,10 @@ foreign js {
     js_get_fetch_body   :: proc(dst: ^u8, dst_len: i32) -> i32 ---
     js_get_fetch_status :: proc() -> i32 ---
     js_set_auth_token   :: proc(token: string) ---
+    js_has_auth_token   :: proc() -> bool ---
+    // Current user sync between JS and WASM
+    js_set_current_user :: proc(name: string) ---
+    js_get_current_user :: proc(dst: ^u8, dst_len: i32) -> i32 ---
 }
 
 root_el: u32

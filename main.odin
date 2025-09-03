@@ -9,6 +9,7 @@ import json "core:encoding/json"
 messages: [dynamic]string
 draft_buf: [1024]u8
 fetch_buf: [16384]u8
+current_username: string
 
 Server_Message :: struct { user: string, text: string, at: string }
 Token_Response :: struct { token: string }
@@ -31,10 +32,15 @@ append_message :: proc(msg: string) {
 on_send :: proc() {
     text := strings.trim_space(get_input_text())
     if len(text) == 0 { return }
+    // Require login (auth token + resolved username)
+    if !js_has_auth_token() || len(strings.trim_space(current_username)) == 0 {
+        append_message("Please sign in with a passkey to send messages.")
+        return
+    }
     // clear input
     js_set_value_by_id("chat-input", "")
     // POST to backend; on completion event 11 will fire
-    body := struct{ user: string, text: string }{"You", text}
+    body := struct{ text: string }{ text }
     data, merr := json.marshal(body)
     if merr != nil {
         append_message("Error: could not encode message")
@@ -87,7 +93,7 @@ App :: proc() -> Node {
     header_props := make(map[string]string)
     header_props["class"] = "chat-header"
     header := Div(header_props,
-        Text("Simple Chat"),
+        Text(fmt.tprintf("Simple Chat — %s", (current_username if len(current_username) > 0 else "You"))),
     )
 
     list_container_props := make(map[string]string)
@@ -191,6 +197,16 @@ on_whoami_fetched :: proc() {
     append_message(msg)
 }
 
+// Handler to pull username from JS and rerender
+on_current_user_updated :: proc() {
+    // Reuse draft_buf as scratch to fetch name from JS
+    n := js_get_current_user(&draft_buf[0], i32(len(draft_buf)))
+    if n < 0 { n = 0 }
+    name := string(draft_buf[:int(n)])
+    current_username = fmt.tprintf("%s", name)
+    rerender()
+}
+
 main :: proc() {
     register_handler(1, on_send)
     register_handler(3, on_clear)
@@ -199,7 +215,8 @@ main :: proc() {
     register_handler(20, on_token_fetched)
     register_handler(12, on_whoami_click)
     register_handler(30, on_whoami_fetched)
+    register_handler(60, on_current_user_updated)
     mount("#app", App)
-    // Get JWT then load messages
-    js_fetch_get("/api/auth/token?sub=You", 20)
+    // Load messages (public)
+    js_fetch_get("/api/messages", 10)
 }
