@@ -6,6 +6,8 @@ import "core:net"
 import "core:sync"
 import "core:time"
 import "core:encoding/json"
+import "core:strconv"
+import "core:strings"
 
 import http "local:odin-http"
 
@@ -15,6 +17,7 @@ PostBody :: struct { user: string, text: string }
 messages: [dynamic]Message
 messages_mu: sync.Mutex
 max_messages := 200
+jwt_secret: string
 
 add_message :: proc(m: Message) {
     sync.lock(&messages_mu)
@@ -36,8 +39,8 @@ get_messages :: proc() -> []Message {
     if messages != nil {
         return messages[:]
     }
-    empty: []Message
-    return empty
+    // Return an empty array rather than null for JSON clients
+    return make([]Message, 0)
 }
 
 main :: proc() {
@@ -51,6 +54,34 @@ main :: proc() {
     defer http.router_destroy(&router)
 
     // API routes
+    // JWT demo: issue and verify
+    jwt_secret = strings.clone("dev-secret-change-me", context.allocator)
+    http.route_get(&router, "/api/auth/token", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+        sub := http.query_get(req.url, "sub") or_else "demo"
+        now := time.now()
+        sbuf: [32]u8
+        iat := strconv.itoa(sbuf[:], int(time.to_unix_seconds(now)))
+        // Minimal payload; in a real app include exp, iss, aud, etc.
+        payload := fmt.tprintf("{\"sub\":\"%s\",\"iat\":\"%s\"}", sub, iat)
+        token := jwt_sign_hs256(payload, transmute([]byte) jwt_secret, context.temp_allocator)
+        http.respond_json(res, struct{ token: string }{ token })
+    }))
+
+    http.route_get(&router, "/api/auth/whoami", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+        auth, ok := http.headers_get_unsafe(req.headers, "authorization")
+        if !ok || !strings.has_prefix(auth, "Bearer ") {
+            http.respond(res, http.Status.Unauthorized)
+            return
+        }
+        tok := strings.trim_prefix(auth, "Bearer ")
+        okv, payload := jwt_verify_hs256(tok, transmute([]byte) jwt_secret, context.temp_allocator)
+        if !okv {
+            http.respond(res, http.Status.Unauthorized)
+            return
+        }
+        // Return the raw payload JSON back
+        http.respond_json(res, struct{ payload: string }{ payload })
+    }))
     http.route_get(&router, "/api/health", http.handler(proc(_: ^http.Request, res: ^http.Response) {
         http.respond_json(res, struct{ ok: bool }{true})
     }))
@@ -83,9 +114,11 @@ main :: proc() {
                 return
             }
             n := time.now()
-            dbuf: [time.MIN_YYYY_DATE_LEN]u8
-            tbuf: [time.MIN_HMS_LEN]u8
-            at := fmt.tprintf("%s %s", time.to_string_yyyy_mm_dd(n, dbuf[:]), time.to_string_hms(n, tbuf[:]))
+            // Use unix seconds as ASCII and clone into long-lived allocator
+            sec := time.to_unix_seconds(n)
+            sbuf: [32]u8
+            sec_str := strconv.itoa(sbuf[:], int(sec))
+            at := strings.clone(sec_str, context.allocator)
             add_message(Message{ user = pb.user, text = pb.text, at = at })
             http.respond_json(res, struct{ status: string }{"ok"}, .Created)
         })
