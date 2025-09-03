@@ -6,7 +6,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     body { font-family: system-ui, sans-serif; padding: 16px; }
-    #console { background: #111; color: #eee; padding: 8px 10px; border-radius: 6px; white-space: pre-wrap; }
     #app { max-width: 560px; }
     .chat-header { font-weight: 600; margin-bottom: 8px; }
     .chat-list { border: 1px solid #ddd; border-radius: 8px; padding: 8px; height: 260px; overflow-y: auto; }
@@ -115,7 +114,7 @@
     };
 
     window.addEventListener('DOMContentLoaded', () => {
-      const pre = document.getElementById('console');
+      const pre = null;
       // Build path must match the output you generate with `odin build` below
       odin.runWasm('./ui.wasm', pre, extraImports, wmi).catch(err => {
         const app = document.getElementById('app');
@@ -147,7 +146,6 @@
       });
       styleObserver.observe(document.getElementById('app'), { childList: true, subtree: true });
     </script>
-    <h3>Console</h3>
-    <pre id="console"></pre>
+    
   </body>
 </html>
