@@ -39,11 +39,34 @@
         js_add_event: (el, ev_ptr, ev_len, id) => {
           const e = hget(el);
           if (!e) return;
-          e.addEventListener(s(ev_ptr, ev_len), () => {
-            if (wmi && wmi.exports && typeof wmi.exports.on_event === 'function') {
-              wmi.exports.on_event(id);
-            }
-          });
+          const name = s(ev_ptr, ev_len);
+          if (name === 'enter') {
+            e.addEventListener('keydown', (evt) => {
+              if (evt.key === 'Enter') {
+                if (wmi && wmi.exports && typeof wmi.exports.on_event === 'function') {
+                  wmi.exports.on_event(id);
+                }
+              }
+            });
+          } else {
+            e.addEventListener(name, () => {
+              if (wmi && wmi.exports && typeof wmi.exports.on_event === 'function') {
+                wmi.exports.on_event(id);
+              }
+            });
+          }
+        },
+        js_get_value_by_id: (id_ptr, id_len, dst_ptr, dst_len) => {
+          const el = document.getElementById(s(id_ptr, id_len));
+          if (!el) return 0;
+          const val = (el.value != null ? String(el.value) : '');
+          const toWrite = val.slice(0, dst_len);
+          return wmi.storeString(dst_ptr, toWrite);
+        },
+        js_set_value_by_id: (id_ptr, id_len, value_ptr, value_len) => {
+          const el = document.getElementById(s(id_ptr, id_len));
+          if (!el) return;
+          el.value = s(value_ptr, value_len);
         },
       }
     };

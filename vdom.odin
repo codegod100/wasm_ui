@@ -31,3 +31,7 @@ Button :: proc(props: map[string]string, children: ..Node) -> Node {
     return Elem("button", props, ..children);
 }
 
+Input :: proc(props: map[string]string) -> Node {
+    // input elements do not have children
+    return Elem("input", props);
+}

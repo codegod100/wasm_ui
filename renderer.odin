@@ -13,6 +13,9 @@ foreign js {
     js_append_child     :: proc(parent, child: u32) ---
     js_remove_children  :: proc(el: u32) ---
     js_add_event        :: proc(el: u32, ev: string, id: u32) ---
+    // Extra helpers for interacting with DOM element values by id
+    js_get_value_by_id  :: proc(id: string, dst: ^u8, dst_len: i32) -> i32 ---
+    js_set_value_by_id  :: proc(id, value: string) ---
 }
 
 root_el: u32
@@ -29,6 +32,9 @@ build_dom :: proc(n: Node) -> u32 {
             if k == "on:click" {
                 id_u64, _ := strconv.parse_u64(v);
                 js_add_event(el, "click", u32(id_u64));
+            } else if k == "on:enter" {
+                id_u64, _ := strconv.parse_u64(v);
+                js_add_event(el, "enter", u32(id_u64));
             } else {
                 js_set_attr(el, k, v);
             }
