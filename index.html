@@ -68,6 +68,10 @@
           if (!el) return;
           el.value = s(value_ptr, value_len);
         },
+        js_focus_by_id: (id_ptr, id_len) => {
+          const el = document.getElementById(s(id_ptr, id_len));
+          if (el && typeof el.focus === 'function') el.focus();
+        },
       }
     };
 

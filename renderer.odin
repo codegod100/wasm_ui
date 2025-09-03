@@ -16,6 +16,7 @@ foreign js {
     // Extra helpers for interacting with DOM element values by id
     js_get_value_by_id  :: proc(id: string, dst: ^u8, dst_len: i32) -> i32 ---
     js_set_value_by_id  :: proc(id, value: string) ---
+    js_focus_by_id      :: proc(id: string) ---
 }
 
 root_el: u32
