@@ -12,6 +12,7 @@ fetch_buf: [16384]u8
 
 Server_Message :: struct { user: string, text: string, at: string }
 Token_Response :: struct { token: string }
+WhoAmI_Response :: struct { payload: string }
 
 get_input_text :: proc() -> string {
     // Fetch value of the input with id="chat-input" from JS into draft_buf
@@ -79,6 +80,9 @@ App :: proc() -> Node {
     clear_btn := make(map[string]string)
     clear_btn["on:click"] = "3"
 
+    whoami_btn := make(map[string]string)
+    whoami_btn["on:click"] = "12"
+
     // Chat header and actions
     header_props := make(map[string]string)
     header_props["class"] = "chat-header"
@@ -97,6 +101,7 @@ App :: proc() -> Node {
     actions := Div(actions_props,
         Input(input_props),
         Button(send_btn, Text(" Send ")),
+        Button(whoami_btn, Text(" Who Am I ")),
         Button(clear_btn, Text(" Clear ")),
     )
 
@@ -161,12 +166,38 @@ on_token_fetched :: proc() {
     js_fetch_get("/api/messages", 10)
 }
 
+on_whoami_click :: proc() {
+    js_fetch_get("/api/auth/whoami", 30)
+}
+
+on_whoami_fetched :: proc() {
+    status := js_get_fetch_status()
+    n := js_get_fetch_body(&fetch_buf[0], i32(len(fetch_buf)))
+    total := int(n)
+    if total < 0 { total = 0 }
+    s := string(fetch_buf[:total])
+    if status != 200 {
+        prev := total; if prev > 120 { prev = 120 }
+        append_message(fmt.tprintf("WhoAmI failed (status %v): %s", status, s[:prev]))
+        return
+    }
+    resp: WhoAmI_Response
+    if err := json.unmarshal_string(s, &resp); err != nil {
+        prev := total; if prev > 120 { prev = 120 }
+        append_message(fmt.tprintf("WhoAmI bad JSON (%v): %s", err, s[:prev]))
+        return
+    }
+    append_message(fmt.tprintf("WhoAmI: %s", resp.payload))
+}
+
 main :: proc() {
     register_handler(1, on_send)
     register_handler(3, on_clear)
     register_handler(10, on_messages_fetched)
     register_handler(11, on_post_done)
     register_handler(20, on_token_fetched)
+    register_handler(12, on_whoami_click)
+    register_handler(30, on_whoami_fetched)
     mount("#app", App)
     // Get JWT then load messages
     js_fetch_get("/api/auth/token?sub=You", 20)
