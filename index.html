@@ -7,7 +7,13 @@
   <style>
     body { font-family: system-ui, sans-serif; padding: 16px; }
     #console { background: #111; color: #eee; padding: 8px 10px; border-radius: 6px; white-space: pre-wrap; }
-    button { margin-left: 8px; padding: 4px 8px; }
+    #app { max-width: 560px; }
+    .chat-header { font-weight: 600; margin-bottom: 8px; }
+    .chat-list { border: 1px solid #ddd; border-radius: 8px; padding: 8px; min-height: 120px; }
+    .chat-row { padding: 4px 6px; border-bottom: 1px dashed #eee; }
+    .chat-row:last-child { border-bottom: none; }
+    .chat-actions { margin-top: 8px; }
+    .chat-actions button { margin-right: 8px; padding: 4px 8px; }
   </style>
   <script src="odin.js"></script>
   <script>
@@ -54,6 +60,20 @@
   <body>
     <h1>Odin WASM UI</h1>
     <div id="app"></div>
+    <script>
+      // Basic styling hooks used by the Odin side
+      const styleObserver = new MutationObserver(() => {
+        const app = document.getElementById('app');
+        if (!app) return;
+        // Add classes to elements by their order to make it look chatty
+        const [header, list, actions] = app.children;
+        if (header) header.classList.add('chat-header');
+        if (list)   list.classList.add('chat-list');
+        if (list)   [...list.children].forEach(c => c.classList.add('chat-row'));
+        if (actions) actions.classList.add('chat-actions');
+      });
+      styleObserver.observe(document.getElementById('app'), { childList: true, subtree: true });
+    </script>
     <h3>Console</h3>
     <pre id="console"></pre>
   </body>
