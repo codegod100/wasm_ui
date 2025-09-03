@@ -17,6 +17,7 @@ foreign js {
     js_get_value_by_id  :: proc(id: string, dst: ^u8, dst_len: i32) -> i32 ---
     js_set_value_by_id  :: proc(id, value: string) ---
     js_focus_by_id      :: proc(id: string) ---
+    js_scroll_to_bottom_by_id :: proc(id: string) ---
 }
 
 root_el: u32

@@ -66,14 +66,19 @@ App :: proc() -> Node {
 
     // Chat header and actions
     header_props := make(map[string]string)
+    header_props["class"] = "chat-header"
     header := Div(header_props,
         Text("Simple Chat"),
     )
 
     list_container_props := make(map[string]string)
+    list_container_props["id"] = "chat-list"
+    list_container_props["class"] = "chat-list"
+    list_container_props["style"] = "height:260px; overflow-y:auto; border:1px solid #ddd; border-radius:8px; padding:8px;"
     list_container := Div(list_container_props, ..msg_nodes[:])
 
     actions_props := make(map[string]string)
+    actions_props["class"] = "chat-actions"
     actions := Div(actions_props,
         Input(input_props),
         Button(send_btn, Text(" Send ")),

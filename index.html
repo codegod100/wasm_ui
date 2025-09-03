@@ -9,7 +9,7 @@
     #console { background: #111; color: #eee; padding: 8px 10px; border-radius: 6px; white-space: pre-wrap; }
     #app { max-width: 560px; }
     .chat-header { font-weight: 600; margin-bottom: 8px; }
-    .chat-list { border: 1px solid #ddd; border-radius: 8px; padding: 8px; min-height: 120px; }
+    .chat-list { border: 1px solid #ddd; border-radius: 8px; padding: 8px; height: 260px; overflow-y: auto; }
     .chat-row { padding: 4px 6px; border-bottom: 1px dashed #eee; }
     .chat-row:last-child { border-bottom: none; }
     .chat-actions { margin-top: 8px; }
@@ -71,6 +71,11 @@
         js_focus_by_id: (id_ptr, id_len) => {
           const el = document.getElementById(s(id_ptr, id_len));
           if (el && typeof el.focus === 'function') el.focus();
+        },
+        js_scroll_to_bottom_by_id: (id_ptr, id_len) => {
+          const el = document.getElementById(s(id_ptr, id_len));
+          if (!el) return;
+          el.scrollTop = el.scrollHeight;
         },
       }
     };

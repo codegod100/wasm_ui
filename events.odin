@@ -15,6 +15,7 @@ register_handler :: proc(id: u32, f: proc()) {
     if handlers == nil { return }
     if f, ok := handlers[id]; ok { f() }
     rerender();
-    // restore focus to input after any event to keep typing fluid
+    // keep chat list scrolled to bottom and input focused
+    js_scroll_to_bottom_by_id("chat-list");
     js_focus_by_id("chat-input");
 }
