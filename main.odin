@@ -187,7 +187,8 @@ on_whoami_fetched :: proc() {
         append_message(fmt.tprintf("WhoAmI bad JSON (%v): %s", err, s[:prev]))
         return
     }
-    append_message(fmt.tprintf("WhoAmI: %s", resp.payload))
+    msg := strings.concatenate([]string{"WhoAmI: ", resp.payload}, context.allocator)
+    append_message(msg)
 }
 
 main :: proc() {

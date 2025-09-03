@@ -14,6 +14,7 @@ import http "local:odin-http"
 // In-memory message store (demo-only)
 Message :: struct { user: string, text: string, at: string }
 PostBody :: struct { user: string, text: string }
+JWT_Payload :: struct { sub: string, iat: string }
 messages: [dynamic]Message
 messages_mu: sync.Mutex
 max_messages := 200
@@ -62,7 +63,13 @@ main :: proc() {
         sbuf: [32]u8
         iat := strconv.itoa(sbuf[:], int(time.to_unix_seconds(now)))
         // Minimal payload; in a real app include exp, iss, aud, etc.
-        payload := fmt.tprintf("{\"sub\":\"%s\",\"iat\":\"%s\"}", sub, iat)
+        p := JWT_Payload{sub = sub, iat = iat}
+        pdata, perr := json.marshal(p)
+        if perr != nil {
+            http.respond(res, http.Status.Internal_Server_Error)
+            return
+        }
+        payload := string(pdata)
         token := jwt_sign_hs256(payload, transmute([]byte) jwt_secret, context.temp_allocator)
         http.respond_json(res, struct{ token: string }{ token })
     }))
