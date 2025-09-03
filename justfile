@@ -1,5 +1,8 @@
 # Simple build recipe for the WASM UI example
 
+# Load environment variables from .env for all recipes (requires recent Just)
+set dotenv-load := true
+
 # Configuration
 target := "js_wasm32"
 out := "ui.wasm"

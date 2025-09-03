@@ -3,7 +3,6 @@ package main
 import "core:fmt"
 import "core:log"
 import "core:net"
-import "core:sync"
 import "core:time"
 import "core:encoding/json"
 import "core:strconv"
@@ -11,41 +10,15 @@ import "core:strings"
 
 import http "local:odin-http"
 
-// In-memory message store (demo-only)
-Message :: struct { user: string, text: string, at: string }
 PostBody :: struct { user: string, text: string }
 JWT_Payload :: struct { sub: string, iat: string }
-messages: [dynamic]Message
-messages_mu: sync.Mutex
-max_messages := 200
 jwt_secret: string
-
-add_message :: proc(m: Message) {
-    sync.lock(&messages_mu)
-    defer sync.unlock(&messages_mu)
-    if messages == nil { messages, _ = make([dynamic]Message) }
-    _, _ = append(&messages, m)
-    if len(messages) > max_messages {
-        // Drop oldest to keep memory bounded
-        start := len(messages) - max_messages
-        trimmed, _ := make([dynamic]Message, 0, max_messages)
-        for x in messages[start:] { _, _ = append(&trimmed, x) }
-        messages = trimmed
-    }
-}
-
-get_messages :: proc() -> []Message {
-    sync.lock(&messages_mu)
-    defer sync.unlock(&messages_mu)
-    if messages != nil {
-        return messages[:]
-    }
-    // Return an empty array rather than null for JSON clients
-    return make([]Message, 0)
-}
 
 main :: proc() {
     context.logger = log.create_console_logger(.Info)
+
+    // Initialize storage (Turso or memory)
+    storage_init()
 
     s: http.Server
     http.server_shutdown_on_interrupt(&s)
@@ -92,6 +65,9 @@ main :: proc() {
     http.route_get(&router, "/api/health", http.handler(proc(_: ^http.Request, res: ^http.Response) {
         http.respond_json(res, struct{ ok: bool }{true})
     }))
+    http.route_get(&router, "/api/storage", http.handler(proc(_: ^http.Request, res: ^http.Response) {
+        http.respond_json(res, storage_status())
+    }))
 
     http.route_get(&router, "/api/time", http.handler(proc(_: ^http.Request, res: ^http.Response) {
         now := time.now()
@@ -102,9 +78,13 @@ main :: proc() {
         http.respond_json(res, body)
     }))
 
+    // Turso is configured via environment variables in storage_init()
+
     // Messages
     http.route_get(&router, "/api/messages", http.handler(proc(_: ^http.Request, res: ^http.Response) {
-        http.respond_json(res, get_messages())
+        msgs, ok := get_messages()
+        if !ok { http.respond(res, http.Status.Internal_Server_Error); return }
+        http.respond_json(res, msgs)
     }))
 
     http.route_post(&router, "/api/messages", http.handler(proc(req: ^http.Request, res: ^http.Response) {
@@ -126,7 +106,10 @@ main :: proc() {
             sbuf: [32]u8
             sec_str := strconv.itoa(sbuf[:], int(sec))
             at := strings.clone(sec_str, context.allocator)
-            add_message(Message{ user = pb.user, text = pb.text, at = at })
+            if ok := add_message(Message{ user = pb.user, text = pb.text, at = at }); !ok {
+                http.respond(res, http.Status.Internal_Server_Error)
+                return
+            }
             http.respond_json(res, struct{ status: string }{"ok"}, .Created)
         })
     }))

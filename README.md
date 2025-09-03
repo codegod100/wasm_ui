@@ -62,7 +62,10 @@ Without just:
 
 ## Notes
 
-- Messages are stored in-memory. Restarting the server clears history.
+- Messages are stored in Turso (libSQL over HTTP). Set environment variables before starting the server:
+  - `TURSO_DATABASE_URL` (or `LIBSQL_URL`)
+  - `TURSO_AUTH_TOKEN` (or `LIBSQL_AUTH_TOKEN`)
+  The server auto-creates the `messages` table if needed. Without these env vars, storage is disabled and message endpoints return 500.
 - JWT secret defaults to `dev-secret-change-me` (see `server/main.odin`). Swap for production.
 - The app shows a spinner until the first render; on failure, it replaces the spinner with a friendly error.
 

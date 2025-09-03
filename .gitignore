@@ -26,3 +26,5 @@ server_bin
 
 # Vendored third-party sources (cloned locally, not tracked)
 vendor/odin-http/
+
+.env
