@@ -406,6 +406,11 @@ turso_ensure_schema :: proc(allocator := context.temp_allocator) -> bool {
         if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (webauthn_challenges)" }
         return false
     }
+    // webauthn challenges (any user, for conditional UI / usernameless)
+    if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS webauthn_challenges_any (challenge TEXT PRIMARY KEY, type TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)", allocator); !ok {
+        if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (webauthn_challenges_any)" }
+        return false
+    }
     return true
 }
 
@@ -634,6 +639,42 @@ delete_challenge :: proc(challenge: string, allocator := context.temp_allocator)
     return ok
 }
 
+// Any-user challenges (for usernameless / conditional)
+insert_challenge_any :: proc(kind: string, challenge: string, ttl_seconds: int = 300, allocator := context.temp_allocator) -> bool {
+    if !turso_enabled { return false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return false }
+    ch := sql_quote(challenge, allocator)
+    k := sql_quote(kind, allocator)
+    ins := fmt.tprintf("INSERT OR REPLACE INTO webauthn_challenges_any(challenge, type, created_at, expires_at) VALUES (%s, %s, CAST(strftime('%%s','now') AS INTEGER), CAST(strftime('%%s','now') AS INTEGER)+%d)", ch, k, ttl_seconds)
+    _, ok := turso_execute(ins, allocator)
+    return ok
+}
+
+get_challenge_any :: proc(challenge: string, kind: string, allocator := context.temp_allocator) -> (created_at: int, expires_at: int, ok: bool) {
+    if !turso_enabled { return 0, 0, false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return 0, 0, false }
+    ch := sql_quote(challenge, allocator)
+    k := sql_quote(kind, allocator)
+    q := fmt.tprintf("SELECT created_at, expires_at FROM webauthn_challenges_any WHERE challenge = %s AND type = %s LIMIT 1", ch, k)
+    res, okq := turso_execute(q, allocator)
+    if !okq || len(res.rows) == 0 { return 0, 0, false }
+    r := res.rows[0]
+    if len(r) < 2 { return 0, 0, false }
+    ca, _ := strconv.parse_int(r[0], 10)
+    ea, _ := strconv.parse_int(r[1], 10)
+    return ca, ea, true
+}
+
+delete_challenge_any :: proc(challenge: string, allocator := context.temp_allocator) -> bool {
+    if !turso_enabled { return false }
+    ch := sql_quote(challenge, allocator)
+    q := fmt.tprintf("DELETE FROM webauthn_challenges_any WHERE challenge = %s", ch)
+    _, ok := turso_execute(q, allocator)
+    return ok
+}
+
 insert_credential :: proc(cred: Credential, allocator := context.temp_allocator) -> bool {
     if !turso_enabled { return false }
     ensure_schema_if_needed()
@@ -662,6 +703,20 @@ get_credential_by_id :: proc(id_b64: string, allocator := context.temp_allocator
     scv, _ := strconv.parse_int(r[4], 10)
     cav, _ := strconv.parse_int(r[6], 10)
     return Credential{ id = r[0], user_id = r[1], public_key = r[2], alg = algv, sign_count = scv, transports = r[5], created_at = cav }, true
+}
+
+// Lookup owning user by credential id via JOIN
+get_user_by_credential_id :: proc(id_b64: string, allocator := context.temp_allocator) -> (u: User, ok: bool) {
+    if !turso_enabled { return User{}, false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return User{}, false }
+    id := sql_quote(id_b64, allocator)
+    q := fmt.tprintf("SELECT u.id, u.username FROM webauthn_credentials c JOIN users u ON u.id = c.user_id WHERE c.id = %s LIMIT 1", id)
+    res, rok := turso_execute(q, allocator)
+    if !rok || len(res.rows) == 0 { return User{}, false }
+    r := res.rows[0]
+    if len(r) < 2 { return User{}, false }
+    return User{ id = r[0], username = r[1] }, true
 }
 
 update_credential_sign_count :: proc(id_b64: string, new_count: int, allocator := context.temp_allocator) -> bool {

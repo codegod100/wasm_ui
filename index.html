@@ -179,6 +179,8 @@
         pubKeyCredParams: opts.pubKeyCredParams,
         timeout: opts.timeout,
         attestation: opts.attestation,
+        authenticatorSelection: opts.authenticatorSelection,
+        extensions: { credProps: true },
         excludeCredentials: (opts.excludeCredentials||[]).map(e => ({ type: e.type, id: b64uToBytes(e.id_b64) })),
       });
 
@@ -213,6 +215,15 @@
           const start = await postJson('/api/auth/passkey/register/start', { username });
           const cred = await navigator.credentials.create({ publicKey: toCreationOptions(start) });
           if (!cred) throw new Error('no credential created');
+          try {
+            const ext = cred.getClientExtensionResults ? cred.getClientExtensionResults() : {};
+            if (ext && ext.credProps) {
+              console.log('credProps', ext.credProps);
+              if (typeof ext.credProps.rk !== 'undefined') {
+                alert('Stored as discoverable credential: ' + (ext.credProps.rk ? 'yes' : 'no'));
+              }
+            }
+          } catch {}
           const att = cred.response;
           const payload = {
             username,
@@ -234,16 +245,22 @@
       };
 
       const onLoginClick = async () => {
-        const username = prompt('Username for passkey sign-in:')?.trim();
-        if (!username) return;
+        // Usernameless login on click: show passkey picker (no username fallback here)
         try {
-          const start = await postJson('/api/auth/passkey/login/start', { username });
-          if (start && start.error) { alert('No credentials for user'); return; }
-          const assertion = await navigator.credentials.get({ publicKey: toRequestOptions(start) });
-          if (!assertion) throw new Error('no assertion');
+          const start = await postJson('/api/auth/passkey/login/conditional/start', {});
+          const assertion = await navigator.credentials.get({
+            mediation: 'optional', // modal picker on click
+            publicKey: toRequestOptions({
+              challenge_b64: start.challenge_b64,
+              timeout: start.timeout,
+              userVerification: start.userVerification,
+              allowCredentials: [],
+            })
+          });
+          if (!assertion) { alert('No passkeys available for this site.'); return; }
           const res = assertion.response;
           const payload = {
-            username,
+            username: '',
             id_b64: assertion.id,
             raw_id_b64: bytesToB64u(new Uint8Array(assertion.rawId)),
             type: assertion.type,
@@ -255,16 +272,54 @@
             }
           };
           const fin = await postJson('/api/auth/passkey/login/finish', payload);
-          console.log('login finish', fin);
+          console.log('login finish (usernameless)', fin);
           alert('Passkey login: ' + (fin && fin.error ? fin.error : 'done'));
         } catch (e) {
-          console.error('login error', e);
-          alert('Login failed: ' + e);
+          console.error('usernameless login error', e);
+          alert('No passkeys available or user cancelled.');
         }
       };
 
       document.getElementById('btn-passkey-register').addEventListener('click', onRegisterClick);
       document.getElementById('btn-passkey-login').addEventListener('click', onLoginClick);
+
+      // Conditional UI (usernameless login): try to show passkey picker automatically
+      (async () => {
+        try {
+          if (!('PublicKeyCredential' in window)) return;
+          const supported = await (PublicKeyCredential.isConditionalMediationAvailable?.() || Promise.resolve(false));
+          if (!supported) return;
+          const start = await postJson('/api/auth/passkey/login/conditional/start', {});
+          const assertion = await navigator.credentials.get({
+            mediation: 'conditional',
+            publicKey: toRequestOptions({
+              challenge_b64: start.challenge_b64,
+              timeout: start.timeout,
+              userVerification: start.userVerification,
+              allowCredentials: [],
+            }),
+          });
+          if (!assertion) return;
+          const res = assertion.response;
+          const payload = {
+            username: '',
+            id_b64: assertion.id,
+            raw_id_b64: bytesToB64u(new Uint8Array(assertion.rawId)),
+            type: assertion.type,
+            response: {
+              authenticatorData_b64: bytesToB64u(new Uint8Array(res.authenticatorData)),
+              clientDataJSON_b64: bytesToB64u(new Uint8Array(res.clientDataJSON)),
+              signature_b64: bytesToB64u(new Uint8Array(res.signature)),
+              userHandle_b64: res.userHandle ? bytesToB64u(new Uint8Array(res.userHandle)) : ''
+            }
+          };
+          const fin = await postJson('/api/auth/passkey/login/finish', payload);
+          console.log('conditional login finish', fin);
+        } catch (e) {
+          // quiet failure to avoid noisy UI if no passkeys
+          console.debug('conditional login skipped', e);
+        }
+      })();
     </script>
     
   </body>

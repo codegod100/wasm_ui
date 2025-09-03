@@ -315,6 +315,16 @@ authdata_parse_cred :: proc(authData: []byte) -> (rpIdHash: [32]byte, flags: u8,
     return rpIdHash, flags, signCount, cred, cose_key, true
 }
 
+// Extract AAGUID (16 bytes) from attested credential authData
+authdata_extract_aaguid :: proc(authData: []byte) -> (aaguid: [16]byte, ok: bool) {
+    // authData layout: rpIdHash(32) flags(1) signCount(4) attestedCredentialData...
+    // For attestation, attestedCredentialData starts at offset 37, first 16 bytes are AAGUID
+    if len(authData) < 37+16+2 { return aaguid, false }
+    // Copy bytes 37..53 into aaguid
+    for i in 0..<16 { aaguid[i] = authData[37+i] }
+    return aaguid, true
+}
+
 // Extract alg (label 3) from COSE key (CBOR map)
 cose_get_alg :: proc(cose: []byte) -> (alg: int, ok: bool) {
     r := CBOR_Reader{ data = cose }

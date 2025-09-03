@@ -128,6 +128,7 @@ main :: proc() {
                 pubKeyCredParams: []struct{ type: string, alg: int },
                 timeout: int,
                 attestation: string,
+                authenticatorSelection: struct{ residentKey: string, requireResidentKey: bool, userVerification: string },
                 excludeCredentials: []struct{ type: string, id_b64: string },
             }{
                 rp = struct{ id: string, name: string }{ ctx.rp_host, "Odin Demo" },
@@ -136,6 +137,7 @@ main :: proc() {
                 pubKeyCredParams = params,
                 timeout = 60000,
                 attestation = "none",
+                authenticatorSelection = struct{ residentKey: string, requireResidentKey: bool, userVerification: string }{ "required", true, "required" },
                 excludeCredentials = exlist[:],
             }
             http.respond_json(res, out)
@@ -187,6 +189,22 @@ main :: proc() {
             }{ challenge_b64 = chall, allowCredentials = allow[:], timeout = 60000, userVerification = "preferred" }
             http.respond_json(res, out)
         })
+    }))
+
+    // Usernameless (Conditional UI) login start: issue an any-user challenge
+    http.route_post(&router, "/api/auth/passkey/login/conditional/start", http.handler(proc(_: ^http.Request, res: ^http.Response) {
+        chall, okc := rand_b64url(32)
+        if !okc { http.respond_json(res, struct{ error: string }{"challenge generation failed"}, http.Status.Internal_Server_Error); return }
+        if !insert_challenge_any("auth", chall) {
+            http.respond_json(res, struct{ error: string }{"failed to save challenge"}, http.Status.Internal_Server_Error)
+            return
+        }
+        out := struct{
+            challenge_b64: string,
+            timeout: int,
+            userVerification: string,
+        }{ challenge_b64 = chall, timeout = 60000, userVerification = "required" }
+        http.respond_json(res, out)
     }))
 
     // WebAuthn finish stubs (not yet implemented)
@@ -286,11 +304,20 @@ main :: proc() {
                 http.respond_json(res, struct{ error: string }{"rpIdHash mismatch"}, http.Status.Bad_Request); return
             }
             // Helpful state for debugging successful parsing
-            log.infof("passkey reg/finish: flags=0x%02x signCount=%d credIdLen=%d coseLen=%d", flags, signCount, len(credId), len(cose))
+            uv := (flags & 0x04) != 0
+            up := (flags & 0x01) != 0
+            aaguid_b64 := ""
+            if ag, okag := authdata_extract_aaguid(authData); okag {
+                aaguid_b64 = base64url_encode(ag[:], context.temp_allocator)
+            }
+            log.infof("passkey reg/finish: flags=0x%02x (UP=%v UV=%v) signCount=%d credIdLen=%d coseLen=%d aaguid=%s", flags, up, uv, signCount, len(credId), len(cose), aaguid_b64)
 
             // Get alg from COSE
             alg, okalg := cose_get_alg(cose)
             if !okalg { http.respond_json(res, struct{ error: string }{"cose alg missing"}, http.Status.Bad_Request); return }
+            alg_name := "unknown"
+            if alg == -7 { alg_name = "ES256" } else if alg == -257 { alg_name = "RS256" }
+            log.infof("passkey reg/finish: cose.alg=%d (%s)", alg, alg_name)
 
             // Store credential (public_key = base64url(COSE))
             pk_b64 := base64url_encode(cose, context.temp_allocator)
@@ -317,11 +344,16 @@ main :: proc() {
                 type: string,
                 response: struct{ authenticatorData_b64: string, clientDataJSON_b64: string, signature_b64: string, userHandle_b64: string },
             }{"","","","", struct{ authenticatorData_b64: string, clientDataJSON_b64: string, signature_b64: string, userHandle_b64: string}{"","","",""}}
-            if json.unmarshal_string(body, &LFin) != nil || len(LFin.username) == 0 { http.respond_json(res, struct{ error: string }{"bad json"}, http.Status.Bad_Request); return }
+            if json.unmarshal_string(body, &LFin) != nil { http.respond_json(res, struct{ error: string }{"bad json"}, http.Status.Bad_Request); return }
 
-            // Get user (must exist)
-            user, uok := get_or_create_user(strings.trim_space(LFin.username))
-            if !uok { http.respond_json(res, struct{ error: string }{"user error"}, http.Status.Internal_Server_Error); return }
+            // Optional user: may be empty for usernameless flow
+            has_username := len(strings.trim_space(LFin.username)) > 0
+            user: User
+            if has_username {
+                u, uok := get_or_create_user(strings.trim_space(LFin.username))
+                if !uok { http.respond_json(res, struct{ error: string }{"user error"}, http.Status.Internal_Server_Error); return }
+                user = u
+            }
 
             // Decode clientDataJSON and authenticatorData
             client_bytes, okc := base64url_decode(LFin.response.clientDataJSON_b64, context.temp_allocator)
@@ -349,14 +381,24 @@ main :: proc() {
             ch_bytes, okcb := base64url_decode(CData.challenge, context.temp_allocator)
             if !okcb { http.respond_json(res, struct{ error: string }{"bad client challenge"}, http.Status.Bad_Request); return }
             ch_norm := base64url_encode(ch_bytes, context.temp_allocator)
-            ch_user, _, _, okg := get_challenge(ch_norm, "auth")
+            used_any := false
+            ch_user := ""
+            _, _, okg := false, false, false
+            ch_user, _, _, okg = get_challenge(ch_norm, "auth")
             if !okg { ch_user, _, _, okg = get_challenge(CData.challenge, "auth") }
-            if !okg { http.respond_json(res, struct{ error: string }{"challenge not found"}, http.Status.Bad_Request); return }
-            if !(ch_user == user.id) { http.respond_json(res, struct{ error: string }{"challenge user mismatch"}, http.Status.Bad_Request); return }
+            if !okg {
+                if _, _, oka := get_challenge_any(ch_norm, "auth"); !oka { _, _, oka = get_challenge_any(CData.challenge, "auth") }
+                if !oka { http.respond_json(res, struct{ error: string }{"challenge not found"}, http.Status.Bad_Request); return }
+                used_any = true
+            }
+            log.infof("passkey login/finish: challenge ok (any=%v)", used_any)
 
             // Parse authenticatorData minimal fields
             rp_hash, flags, signCount, okp := authdata_parse_assert(auth_bytes)
             if !okp { http.respond_json(res, struct{ error: string }{"authData parse error"}, http.Status.Bad_Request); return }
+            uv := (flags & 0x04) != 0
+            up := (flags & 0x01) != 0
+            log.infof("passkey login/finish: flags=0x%02x (UP=%v UV=%v) signCount=%d", flags, up, uv, signCount)
             expected_rp_hash := rp_id_hash(rp_id)
             match := true
             for i in 0..<32 { if expected_rp_hash[i] != rp_hash[i] { match = false; break } }
@@ -367,9 +409,31 @@ main :: proc() {
                 http.respond_json(res, struct{ error: string }{"rpIdHash mismatch"}, http.Status.Bad_Request); return
             }
 
-            // Load credential by id and check ownership
+            // Load credential by id and check/derive ownership
+            log.infof("passkey login/finish: lookup credential id=%s", LFin.raw_id_b64)
             cred, cok := get_credential_by_id(LFin.raw_id_b64)
-            if !cok || !(cred.user_id == user.id) { http.respond_json(res, struct{ error: string }{"credential not found"}, http.Status.Not_Found); return }
+            if !cok {
+                log.warnf("passkey login/finish: credential not found id=%s (last_status=%v last_err=%s last_sql=%s)", LFin.raw_id_b64, storage_last_status, storage_last_error, storage_last_sql)
+                http.respond_json(res, struct{ error: string }{"credential not found"}, http.Status.Not_Found); return
+            }
+            if has_username {
+                if !(cred.user_id == user.id) { http.respond_json(res, struct{ error: string }{"credential user mismatch"}, http.Status.Bad_Request); return }
+            } else {
+                // Derive user via JOIN for clarity
+                u2, uok := get_user_by_credential_id(LFin.raw_id_b64)
+                if !uok { http.respond_json(res, struct{ error: string }{"user for credential not found"}, http.Status.Not_Found); return }
+                user = u2
+                log.infof("passkey login/finish: user resolved via credential: id=%s username=%s", user.id, user.username)
+            }
+
+            // Decode and log userHandle if present
+            if len(LFin.response.userHandle_b64) > 0 {
+                uh, okuh := base64url_decode(LFin.response.userHandle_b64, context.temp_allocator)
+                if okuh {
+                    uh_b64 := base64url_encode(uh, context.temp_allocator)
+                    log.infof("passkey login/finish: userHandleLen=%d matchesUser=%v", len(uh), string(uh) == user.id)
+                }
+            }
 
             // Build signed data = authenticatorData || SHA256(clientDataJSON)
             cd_hash: [32]byte
@@ -391,7 +455,7 @@ main :: proc() {
             if int(signCount) > cred.sign_count { _ = update_credential_sign_count(cred.id, int(signCount)) }
 
             // Consume challenge
-            _ = delete_challenge(ch_norm)
+            if used_any { _ = delete_challenge_any(ch_norm) } else { _ = delete_challenge(ch_norm) }
 
             http.respond_json(res, struct{ status: string }{"ok"})
         })
