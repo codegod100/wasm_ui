@@ -1,0 +1,24 @@
+# OS & editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
+*.swo
+*.swn
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build artifacts
+dist/
+build/
+target/
+node_modules/
+
+# Odin WASM build outputs
+*.wasm
+odin.js
+

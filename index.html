@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Odin WASM UI</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 16px; }
+    #console { background: #111; color: #eee; padding: 8px 10px; border-radius: 6px; white-space: pre-wrap; }
+    button { margin-left: 8px; padding: 4px 8px; }
+  </style>
+  <script src="odin.js"></script>
+  <script>
+    // Hold a WasmMemoryInterface so we can access exports for callbacks
+    const wmi = new odin.WasmMemoryInterface();
+
+    // Provide imports for Odin's `foreign import "js"` stubs via extra imports
+    // Simple handle table for DOM nodes (WASM passes u32 handles, not JS objects)
+    const H = { next: 1, table: Object.create(null) };
+    const hput = (obj) => { const id = H.next++; H.table[id] = obj; return id; };
+    const hget = (id) => H.table[id];
+
+    const s = (ptr, len) => wmi.loadString(ptr, len);
+
+    const extraImports = {
+      js: {
+        js_query_selector: (sel_ptr, sel_len) => hput(document.querySelector(s(sel_ptr, sel_len))),
+        js_create_element: (tag_ptr, tag_len) => hput(document.createElement(s(tag_ptr, tag_len))),
+        js_create_text_node: (text_ptr, text_len) => hput(document.createTextNode(s(text_ptr, text_len))),
+        js_set_attr: (el, name_ptr, name_len, value_ptr, value_len) => hget(el)?.setAttribute(s(name_ptr, name_len), s(value_ptr, value_len)),
+        js_append_child: (parent, child) => hget(parent)?.appendChild(hget(child)),
+        js_remove_children: (el) => { const e = hget(el); if (!e) return; while (e.firstChild) e.removeChild(e.firstChild); },
+        js_add_event: (el, ev_ptr, ev_len, id) => {
+          const e = hget(el);
+          if (!e) return;
+          e.addEventListener(s(ev_ptr, ev_len), () => {
+            if (wmi && wmi.exports && typeof wmi.exports.on_event === 'function') {
+              wmi.exports.on_event(id);
+            }
+          });
+        },
+      }
+    };
+
+    window.addEventListener('DOMContentLoaded', () => {
+      const pre = document.getElementById('console');
+      // Build path must match the output you generate with `odin build` below
+      odin.runWasm('./ui.wasm', pre, extraImports, wmi).catch(err => {
+        console.error('Failed to run WASM', err);
+      });
+    });
+  </script>
+  </head>
+  <body>
+    <h1>Odin WASM UI</h1>
+    <div id="app"></div>
+    <h3>Console</h3>
+    <pre id="console"></pre>
+  </body>
+</html>
