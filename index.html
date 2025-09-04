@@ -123,8 +123,18 @@
 
     window.addEventListener('DOMContentLoaded', () => {
       const pre = null;
+      // Restore session auth (if present)
+      try {
+        const t = sessionStorage.getItem('authToken');
+        if (t) window.__authToken = t;
+        const u = sessionStorage.getItem('authUsername');
+        if (u) window.__currentUser = u;
+      } catch {}
       // Build path must match the output you generate with `odin build` below
-      odin.runWasm('./ui.wasm', pre, extraImports, wmi).catch(err => {
+      odin.runWasm('./ui.wasm', pre, extraImports, wmi).then(() => {
+        // Notify WASM to pick up restored username, if any
+        if (window.__currentUser && wmi?.exports?.on_event) wmi.exports.on_event(60);
+      }).catch(err => {
         const app = document.getElementById('app');
         if (app) app.innerHTML = '<div class="loading"><div class="spinner"></div><span>Failed to load UI</span></div>';
         console.error('Failed to run WASM', err);
@@ -143,6 +153,7 @@
     <div style="margin-top:16px; padding-top:8px; border-top:1px solid #eee;">
       <button id="btn-passkey-register">Register Passkey</button>
       <button id="btn-passkey-login">Sign in with Passkey</button>
+      <div id="auth-status" style="margin-top:8px; min-height:20px; color:#6b7280;"></div>
     </div>
     <script>
       // Basic styling hooks used by the Odin side
@@ -216,6 +227,18 @@
         }
       };
 
+      // Prevent overlapping WebAuthn requests (spec forbids concurrent calls)
+      let __webauthnPending = false;
+      let __webauthnAbortCtrl = null;
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+      const setAuthStatus = (msg, kind = 'info') => {
+        const el = document.getElementById('auth-status');
+        if (!el) return;
+        el.textContent = msg || '';
+        el.style.color = kind === 'error' ? '#b91c1c' : (kind === 'success' ? '#065f46' : '#6b7280');
+      };
+
       const onRegisterClick = async () => {
         const username = prompt('Username for passkey registration:')?.trim();
         if (!username) return;
@@ -227,8 +250,9 @@
             const ext = cred.getClientExtensionResults ? cred.getClientExtensionResults() : {};
             if (ext && ext.credProps) {
               console.log('credProps', ext.credProps);
+              // Log whether a resident key was stored (for debugging)
               if (typeof ext.credProps.rk !== 'undefined') {
-                alert('Stored as discoverable credential: ' + (ext.credProps.rk ? 'yes' : 'no'));
+                console.log('discoverable credential:', !!ext.credProps.rk);
               }
             }
           } catch {}
@@ -245,15 +269,26 @@
           };
           const fin = await postJson('/api/auth/passkey/register/finish', payload);
           console.log('register finish', fin);
-          alert('Passkey registration: ' + (fin && fin.error ? fin.error : 'done'));
         } catch (e) {
           console.error('register error', e);
-          alert('Register failed: ' + e);
         }
       };
 
       const onLoginClick = async () => {
         // Usernameless login on click: show passkey picker (no username fallback here)
+        // If a background conditional request is in-flight, abort it so this click can take over.
+        if (__webauthnAbortCtrl) {
+          try { __webauthnAbortCtrl.abort(); } catch {}
+          // Wait briefly for the abort to propagate and clear pending flag
+          const t0 = Date.now();
+          while (__webauthnPending && Date.now() - t0 < 500) { await sleep(10); }
+        }
+        if (__webauthnPending) { console.debug('WebAuthn still settling; try again'); return; }
+        __webauthnPending = true;
+        const btn = document.getElementById('btn-passkey-login');
+        const prev = btn ? btn.textContent : '';
+        if (btn) { btn.disabled = true; btn.textContent = 'Opening passkey…'; }
+        setAuthStatus('Contacting server…');
         try {
           const start = await postJson('/api/auth/passkey/login/conditional/start', {});
           const assertion = await navigator.credentials.get({
@@ -265,7 +300,7 @@
               allowCredentials: [],
             })
           });
-          if (!assertion) { alert('No passkeys available for this site.'); return; }
+          if (!assertion) { console.info('No passkeys available for this site.'); return; }
           const res = assertion.response;
           const payload = {
             username: '',
@@ -282,15 +317,24 @@
           const fin = await postJson('/api/auth/passkey/login/finish', payload);
           console.log('login finish (usernameless)', fin);
           if (fin && fin.username) {
-            // push to WASM and trigger UI update
+            // Persist session + push to WASM and trigger UI update
             window.__currentUser = fin.username;
-            if (fin.token) window.__authToken = fin.token;
+            try { sessionStorage.setItem('authUsername', fin.username); } catch {}
+            if (fin.token) {
+              window.__authToken = fin.token;
+              try { sessionStorage.setItem('authToken', fin.token); } catch {}
+            }
             if (wmi?.exports?.on_event) wmi.exports.on_event(60);
+            setAuthStatus(`Signed in as ${fin.username}`, 'success');
           }
-          alert('Passkey login: ' + (fin && fin.error ? fin.error : 'done'));
+          // no alert; UI updates via username/token set above
         } catch (e) {
           console.error('usernameless login error', e);
-          alert('No passkeys available or user cancelled.');
+          const msg = (e && e.message) ? e.message : String(e);
+          setAuthStatus(`Sign-in failed: ${msg}`, 'error');
+        } finally {
+          __webauthnPending = false;
+          if (btn) { btn.disabled = false; btn.textContent = prev; }
         }
       };
 
@@ -299,10 +343,15 @@
 
       // Conditional UI (usernameless login): try to show passkey picker automatically
       (async () => {
+        let ctrlRef = null;
         try {
           if (!('PublicKeyCredential' in window)) return;
           const supported = await (PublicKeyCredential.isConditionalMediationAvailable?.() || Promise.resolve(false));
           if (!supported) return;
+          if (__webauthnPending) return; // another flow already in-flight
+          __webauthnPending = true;
+          ctrlRef = new AbortController();
+          __webauthnAbortCtrl = ctrlRef;
           const start = await postJson('/api/auth/passkey/login/conditional/start', {});
           const assertion = await navigator.credentials.get({
             mediation: 'conditional',
@@ -312,6 +361,7 @@
               userVerification: start.userVerification,
               allowCredentials: [],
             }),
+            signal: ctrlRef.signal,
           });
           if (!assertion) return;
           const res = assertion.response;
@@ -332,6 +382,9 @@
         } catch (e) {
           // quiet failure to avoid noisy UI if no passkeys
           console.debug('conditional login skipped', e);
+        } finally {
+          if (__webauthnAbortCtrl === ctrlRef) __webauthnAbortCtrl = null;
+          __webauthnPending = false;
         }
       })();
     </script>

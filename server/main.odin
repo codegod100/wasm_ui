@@ -197,7 +197,9 @@ main :: proc() {
         if !okc { http.respond_json(res, struct{ error: string }{"challenge generation failed"}, http.Status.Internal_Server_Error); return }
         if !insert_challenge_any("auth", chall) {
             log.warnf("conditional/start: insert challenge failed; status=%v err=%s sql=%s", storage_last_status, storage_last_error, storage_last_sql)
-            http.respond_json(res, struct{ error: string }{"failed to save challenge"}, http.Status.Internal_Server_Error)
+            msg := "storage error; check server logs and TURSO env"
+            if !turso_enabled { msg = "storage disabled; set TURSO_DATABASE_URL/TURSO_AUTH_TOKEN" }
+            http.respond_json(res, struct{ error: string }{ msg }, http.Status.Internal_Server_Error)
             return
         }
         out := struct{

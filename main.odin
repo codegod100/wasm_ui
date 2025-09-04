@@ -93,7 +93,7 @@ App :: proc() -> Node {
     header_props := make(map[string]string)
     header_props["class"] = "chat-header"
     header := Div(header_props,
-        Text(fmt.tprintf("Simple Chat — %s", (current_username if len(current_username) > 0 else "You"))),
+        Text("Simple Chat"),
     )
 
     list_container_props := make(map[string]string)
@@ -104,8 +104,14 @@ App :: proc() -> Node {
 
     actions_props := make(map[string]string)
     actions_props["class"] = "chat-actions"
+    // Username chip next to input (only if logged in)
+    name_chip := Node{}
+    if len(current_username) > 0 {
+        name_chip = Text(fmt.tprintf(" — %s", current_username))
+    }
     actions := Div(actions_props,
         Input(input_props),
+        name_chip,
         Button(send_btn, Text(" Send ")),
         Button(whoami_btn, Text(" Who Am I ")),
         Button(clear_btn, Text(" Clear ")),
