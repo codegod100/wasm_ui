@@ -8,6 +8,7 @@ import "core:encoding/json"
 import "core:strconv"
 import "core:strings"
 import hash "core:crypto/hash"
+import "core:os"
 
 import http "local:odin-http"
 
@@ -15,11 +16,32 @@ PostBody :: struct { user: string, text: string }
 JWT_Payload :: struct { sub: string, iat: string }
 jwt_secret: string
 
+// Bluesky OAuth (config via env; client_id optional)
+bsky_client_id: string
+bsky_redirect_uri: string
+bsky_authz_endpoint: string
+bsky_token_endpoint: string
+bsky_scope: string
+
 main :: proc() {
-    context.logger = log.create_console_logger(.Info)
+    // Log level from env (LOG_LEVEL=debug|info|warn|error)
+    lvl_str := strings.to_lower(os.get_env("LOG_LEVEL"))
+    lvl := log.Level.Info
+    if lvl_str == "debug" { lvl = log.Level.Debug }
+    else if lvl_str == "warn" { lvl = log.Level.Warning }
+    else if lvl_str == "error" { lvl = log.Level.Error }
+    context.logger = log.create_console_logger(lvl)
 
     // Initialize storage (Turso or memory)
     storage_init()
+
+    // Load Bluesky OAuth config from env
+    bsky_client_id = strings.clone(os.get_env("BSKY_OAUTH_CLIENT_ID"), context.allocator)
+    bsky_redirect_uri = strings.clone(os.get_env("BSKY_OAUTH_REDIRECT_URI"), context.allocator)
+    bsky_authz_endpoint = strings.clone(os.get_env("BSKY_OAUTH_AUTHORIZATION_ENDPOINT"), context.allocator)
+    bsky_token_endpoint = strings.clone(os.get_env("BSKY_OAUTH_TOKEN_ENDPOINT"), context.allocator)
+    bsky_scope = strings.clone(os.get_env("BSKY_OAUTH_SCOPE"), context.allocator)
+    if len(bsky_scope) == 0 { bsky_scope = strings.clone("atproto transition:generic", context.allocator) }
 
     s: http.Server
     http.server_shutdown_on_interrupt(&s)
@@ -64,7 +86,7 @@ main :: proc() {
         http.respond_json(res, struct{ payload: string }{ payload })
     }))
     // WebAuthn (Passkey) registration start
-    http.route_post(&router, "/api/auth/passkey/register/start", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+    if PASSKEYS_ENABLED do http.route_post(&router, "/api/auth/passkey/register/start", http.handler(proc(req: ^http.Request, res: ^http.Response) {
         // Compute rp_host from Host header once (host without port)
         rp_host := "localhost"
         if h, ok := http.headers_get_unsafe(req.headers, "host"); ok {
@@ -145,7 +167,7 @@ main :: proc() {
     }))
 
     // WebAuthn (Passkey) authentication start
-    http.route_post(&router, "/api/auth/passkey/login/start", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+    if PASSKEYS_ENABLED do http.route_post(&router, "/api/auth/passkey/login/start", http.handler(proc(req: ^http.Request, res: ^http.Response) {
         http.body(req, 1<<20, res, proc(rp: rawptr, body: http.Body, berr: http.Body_Error) {
             res := cast(^http.Response)rp
             if berr != nil { http.respond(res, http.body_error_status(berr)); return }
@@ -192,7 +214,7 @@ main :: proc() {
     }))
 
     // Usernameless (Conditional UI) login start: issue an any-user challenge
-    http.route_post(&router, "/api/auth/passkey/login/conditional/start", http.handler(proc(_: ^http.Request, res: ^http.Response) {
+    if PASSKEYS_ENABLED do http.route_post(&router, "/api/auth/passkey/login/conditional/start", http.handler(proc(_: ^http.Request, res: ^http.Response) {
         chall, okc := rand_b64url(32)
         if !okc { http.respond_json(res, struct{ error: string }{"challenge generation failed"}, http.Status.Internal_Server_Error); return }
         if !insert_challenge_any("auth", chall) {
@@ -211,7 +233,7 @@ main :: proc() {
     }))
 
     // WebAuthn finish stubs (not yet implemented)
-    http.route_post(&router, "/api/auth/passkey/register/finish", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+    if PASSKEYS_ENABLED do http.route_post(&router, "/api/auth/passkey/register/finish", http.handler(proc(req: ^http.Request, res: ^http.Response) {
         // Pre-compute host for rpId/origin checks inside body callback
         host_header := ""
         if h, ok := http.headers_get_unsafe(req.headers, "host"); ok { host_header = h }
@@ -332,7 +354,182 @@ main :: proc() {
             http.respond_json(res, struct{ status: string, id_b64: string }{"ok", RFin.raw_id_b64})
         })
     }))
-    http.route_post(&router, "/api/auth/passkey/login/finish", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+
+    // Bluesky OAuth: start (PKCE)
+    http.route_post(&router, "/api/auth/bsky/start", http.handler(proc(_: ^http.Request, res: ^http.Response) {
+        if len(bsky_redirect_uri) == 0 || len(bsky_authz_endpoint) == 0 || len(bsky_token_endpoint) == 0 {
+            http.respond_json(res, struct{ error: string }{"oauth not configured"}, http.Status.Bad_Request)
+            return
+        }
+        // Generate state and PKCE verifier
+        state, ok1 := rand_b64url(24)
+        verifier, ok2 := rand_b64url(64)
+        if !ok1 || !ok2 { http.respond_json(res, struct{ error: string }{"entropy error"}, http.Status.Internal_Server_Error); return }
+        // code_challenge = BASE64URL-ENCODE(SHA256(verifier))
+        ctx_hash: hash.Context
+        hash.init(&ctx_hash, hash.Algorithm.SHA256)
+        hash.update(&ctx_hash, transmute([]byte)verifier)
+        sha: [32]u8
+        hash.final(&ctx_hash, sha[:])
+        challenge := base64url_encode(sha[:], context.temp_allocator)
+        // persist state
+        if !oauth_insert_state(state, verifier, "bsky") {
+            msg := "storage error; check server logs and TURSO env"
+            if !turso_enabled { msg = "storage disabled; set TURSO_DATABASE_URL/TURSO_AUTH_TOKEN" }
+            http.respond_json(res, struct{ error: string }{ msg }, http.Status.Internal_Server_Error)
+            return
+        }
+        // URL-encode helper (RFC3986) for ASCII strings
+        url_encode := proc(sv: string, alloc := context.temp_allocator) -> string {
+            out := strings.builder_make(0, len(sv)*3, alloc)
+            hexdigits := "0123456789ABCDEF"
+            data := transmute([]byte)sv
+            for b in data {
+                ok := (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '-' || b == '_' || b == '.' || b == '~'
+                if ok { strings.write_byte(&out, b) }
+                else {
+                    strings.write_string(&out, "%")
+                    strings.write_byte(&out, hexdigits[b >> 4])
+                    strings.write_byte(&out, hexdigits[b & 0x0F])
+                }
+            }
+            return strings.to_string(out)
+        }
+        // Build authorization URL
+        // Default client_id to http://localhost with query carrying redirect_uri and scope (per atcute/browser-client)
+        cid := bsky_client_id
+        if len(cid) == 0 {
+            cid = strings.concatenate([]string{
+                "http://localhost?redirect_uri=",
+                url_encode(bsky_redirect_uri),
+                "&scope=",
+                url_encode(bsky_scope),
+            }, context.temp_allocator)
+        }
+        // Inline client metadata (per atcute/browser-client guidance), include our exact redirect_uri
+        md := struct{
+            client_name: string,
+            client_uri: string,
+            redirect_uris: []string,
+            token_endpoint_auth_method: string,
+            application_type: string,
+            dpop_bound_access_tokens: bool,
+            grant_types: []string,
+            response_types: []string,
+            scope: string,
+        }{
+            client_name = "Native atproto client",
+            client_uri = "http://localhost/",
+            redirect_uris = []string{ bsky_redirect_uri, "http://127.0.0.1/", "http://[::1]/" },
+            token_endpoint_auth_method = "none",
+            application_type = "native",
+            dpop_bound_access_tokens = true,
+            grant_types = []string{"authorization_code", "refresh_token"},
+            response_types = []string{"code"},
+            scope = bsky_scope,
+        }
+        md_json, _ := json.marshal(md)
+        md_str := string(md_json)
+        // Provide inline client metadata to avoid the AS trying to fetch from client_id URL
+        q := []string{
+            strings.concatenate([]string{"response_type=code"}, context.temp_allocator),
+            strings.concatenate([]string{"client_id=", url_encode(cid)}, context.temp_allocator),
+            strings.concatenate([]string{"redirect_uri=", url_encode(bsky_redirect_uri)}, context.temp_allocator),
+            strings.concatenate([]string{"scope=", url_encode(bsky_scope)}, context.temp_allocator),
+            strings.concatenate([]string{"code_challenge=", url_encode(challenge)}, context.temp_allocator),
+            strings.concatenate([]string{"code_challenge_method=S256"}, context.temp_allocator),
+            strings.concatenate([]string{"state=", url_encode(state)}, context.temp_allocator),
+            strings.concatenate([]string{"client_metadata=", url_encode(md_str)}, context.temp_allocator),
+        }
+        qs := strings.join(q, "&", context.temp_allocator)
+        auth_url := strings.concatenate([]string{ bsky_authz_endpoint, "?", qs }, context.temp_allocator)
+        log.infof("oauth start: url=%s", auth_url)
+        http.respond_json(res, struct{ url: string, state: string, code_verifier: string, client_id: string, token_endpoint: string, redirect_uri: string, scope: string }{ auth_url, state, verifier, cid, bsky_token_endpoint, bsky_redirect_uri, bsky_scope })
+    }))
+
+    // Bluesky OAuth: exchange code for our JWT
+    http.route_post(&router, "/api/auth/bsky/exchange", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+        http.body(req, 1<<20, res, proc(rp: rawptr, body: http.Body, berr: http.Body_Error) {
+            res := cast(^http.Response)rp
+            if berr != nil { http.respond_json(res, struct{ error: string }{"bad body"}, http.body_error_status(berr)); return }
+            IN := struct{ code: string, state: string, issuer: string }{"","",""}
+            if json.unmarshal_string(body, &IN) != nil || len(IN.code) == 0 || len(IN.state) == 0 { http.respond_json(res, struct{ error: string }{"bad json"}, http.Status.Bad_Request); return }
+            if len(IN.issuer) > 0 {
+                log.infof("oauth exchange issuer=%s", IN.issuer)
+            }
+            verifier, provider, ok := oauth_take_state(IN.state)
+            if !ok || provider != "bsky" { http.respond_json(res, struct{ error: string }{"state invalid"}, http.Status.Bad_Request); return }
+            if len(bsky_redirect_uri) == 0 || len(bsky_token_endpoint) == 0 { http.respond_json(res, struct{ error: string }{"oauth not configured"}, http.Status.Bad_Request); return }
+            // Build x-www-form-urlencoded body
+            enc := proc(s: string, alloc := context.temp_allocator) -> string {
+                b := strings.builder_make(0, len(s)*3, alloc)
+                hexdigits := "0123456789ABCDEF"
+                data := transmute([]byte)s
+                for v in data {
+                    ok := (v >= 'a' && v <= 'z') || (v >= 'A' && v <= 'Z') || (v >= '0' && v <= '9') || v == '-' || v == '_' || v == '.' || v == '~'
+                    if ok { strings.write_byte(&b, v) }
+                    else {
+                        strings.write_string(&b, "%")
+                        strings.write_byte(&b, hexdigits[v >> 4])
+                        strings.write_byte(&b, hexdigits[v & 0x0F])
+                    }
+                }
+                return strings.to_string(b)
+            }
+            // client_id must match the value used at authorization time
+            cid := bsky_client_id
+            if len(cid) == 0 {
+                cid = "http://localhost"
+            }
+            form := strings.join([]string{
+                strings.concatenate([]string{"grant_type=authorization_code"}, context.temp_allocator),
+                strings.concatenate([]string{"code=", enc(IN.code)}, context.temp_allocator),
+                strings.concatenate([]string{"redirect_uri=", enc(bsky_redirect_uri)}, context.temp_allocator),
+                strings.concatenate([]string{"client_id=", enc(cid)}, context.temp_allocator),
+                strings.concatenate([]string{"code_verifier=", enc(verifier)}, context.temp_allocator),
+            }, "&", context.temp_allocator)
+            status, body_str, okp := https_post_raw(bsky_token_endpoint, "application/x-www-form-urlencoded", form, make([]string,0), context.temp_allocator)
+            log.infof("oauth exchange: status=%v body[0:200]=%s", status, body_str[:min(200, len(body_str))])
+            if !okp || status < 200 || status >= 300 { http.respond_json(res, struct{ error: string }{ fmt.tprintf("token http %v", status) }, http.Status.Bad_Request); return }
+            // Parse token response (fields vary per provider)
+            tr := struct { access_token: string, refresh_token: string, token_type: string, expires_in: int, id_token: string, scope: string, did: string, handle: string, sub: string }{"","","",0,"","","","",""}
+            _ = json.unmarshal_string(body_str, &tr)
+            // Try to infer username (handle preferred, else did/sub from id_token)
+            username := tr.handle
+            if len(username) == 0 { username = tr.did }
+            if len(username) == 0 && len(tr.id_token) > 0 {
+                parts := strings.split(tr.id_token, ".")
+                if len(parts) >= 2 {
+                    pb, okb := base64url_decode(parts[1], context.temp_allocator)
+                    if okb {
+                        P := struct{ sub: string, did: string, handle: string }{"","",""}
+                        if json.unmarshal_string(string(pb), &P) == nil {
+                            if len(P.handle) > 0 { username = P.handle }
+                            else if len(P.did) > 0 { username = P.did }
+                            else if len(P.sub) > 0 { username = P.sub }
+                        }
+                    }
+                }
+            }
+            if len(username) == 0 && len(tr.sub) > 0 { username = tr.sub }
+            if len(username) == 0 { username = "bsky" }
+            // Issue our JWT and persist session user
+            // Issue token
+            pl := JWT_Payload{ sub = username, iat = "" }
+            pdata, perr := json.marshal(pl)
+            if perr != nil { http.respond_json(res, struct{ error: string }{"jwt marshal error"}, http.Status.Internal_Server_Error); return }
+            tok := jwt_sign_hs256(string(pdata), transmute([]byte) jwt_secret, context.temp_allocator)
+            http.respond_json(res, struct{ token: string, username: string }{ tok, username })
+        })
+    }))
+
+    // OAuth callback page: captures code/state, posts to opener; keeps window open on error with details
+    http.route_get(&router, "/oauth/callback", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+        // Render simple HTML with script to relay code/state and show error details
+        tmpl := "<!doctype html><html><head><meta charset=\"utf-8\"><title>OAuth Callback</title><style>body{font-family:system-ui,sans-serif;padding:16px}code{background:#f3f4f6;padding:2px 4px;border-radius:4px}</style></head><body><script>(function(){var p=new URLSearchParams(location.search);var err=p.get('error')||'';var errDesc=p.get('error_description')||'';var errUri=p.get('error_uri')||'';var code=p.get('code')||'';var state=p.get('state')||'';var msg={source:'bsky_oauth',code:code,state:state,error:err,error_description:errDesc,error_uri:errUri};try{window.opener&&window.opener.postMessage(msg,'*');}catch(e){}function esc(x){return String(x).replace(/&/g,'&amp;').replace(/</g,'&lt;');}function cleanUrl(u){return String(u).replace(/\"/g,'');}if(err){document.write('<h2>Sign-in failed</h2>');document.write('<p><b>Error:</b> <code>'+esc(err)+'</code></p>');if(errDesc){document.write('<p><b>Description:</b> '+esc(errDesc)+'</p>');}if(errUri){document.write('<p><a href=\"'+cleanUrl(errUri)+'\" target=\"_blank\" rel=\"noopener noreferrer\">More info</a></p>');}document.write('<p>You can close this window.</p>');}else{document.write('You may close this window.');setTimeout(function(){window.close();},10);}})();</script></body></html>"
+        http.respond_html(res, tmpl, http.Status.OK)
+    }))
+    if PASSKEYS_ENABLED do http.route_post(&router, "/api/auth/passkey/login/finish", http.handler(proc(req: ^http.Request, res: ^http.Response) {
         // Pre-capture host header to infer rp.id
         host_header := ""
         if h, ok := http.headers_get_unsafe(req.headers, "host"); ok { host_header = h }
@@ -476,6 +673,13 @@ main :: proc() {
     http.route_get(&router, "/api/storage", http.handler(proc(_: ^http.Request, res: ^http.Response) {
         http.respond_json(res, storage_status())
     }))
+    // Explicit schema ensure endpoint (manual trigger)
+    http.route_post(&router, "/api/admin/storage/ensure", http.handler(proc(_: ^http.Request, res: ^http.Response) {
+        // Force a re-attempt at ensuring schema; useful if first attempt failed earlier
+        turso_schema_attempted = true
+        turso_schema_ready = turso_ensure_schema()
+        http.respond_json(res, storage_status())
+    }))
 
     http.route_get(&router, "/api/time", http.handler(proc(_: ^http.Request, res: ^http.Response) {
         now := time.now()
@@ -571,3 +775,5 @@ main :: proc() {
         fmt.printf("server stopped: %v\n", err)
     }
 }
+// Feature flags
+PASSKEYS_ENABLED :: false

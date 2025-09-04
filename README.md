@@ -39,6 +39,23 @@ Without just:
 - WASM: `odin build . -target:js_wasm32 -out:./ui.wasm`
 - Server: `odin build ./server -collection:local=./vendor -out:./server_bin && ./server_bin`
 
+### Debug logs
+
+- One-off: `LOG_LEVEL=debug just serve`
+- Or use the recipe: `just serve-debug`
+- Levels: `debug`, `info` (default), `warn`, `error` via `LOG_LEVEL`.
+
+### Bluesky OAuth (optional)
+
+Enable “Sign in with Bluesky” by setting these environment variables (e.g., in `.env`):
+
+- `BSKY_OAUTH_REDIRECT_URI`: Use `http://127.0.0.1:8080/` (or your host) and ensure it’s registered.
+- `BSKY_OAUTH_AUTHORIZATION_ENDPOINT`: e.g. `https://bsky.social/oauth/authorize`.
+- `BSKY_OAUTH_TOKEN_ENDPOINT`: e.g. `https://bsky.social/oauth/token`.
+- `BSKY_OAUTH_SCOPE` (optional): Defaults to `profile offline_access`.
+
+Click “Sign in with Bluesky” in the UI to run a PKCE flow. On success, the server exchanges the code and issues a local JWT; the UI stores it and updates the current user.
+
 ## Endpoints
 
 - `GET /api/messages` → `[{ user, text, at }]`

@@ -427,6 +427,11 @@ turso_ensure_schema :: proc(allocator := context.temp_allocator) -> bool {
         if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (webauthn_challenges_any)" }
         return false
     }
+    // OAuth transient state for PKCE
+    if _, ok := turso_execute("CREATE TABLE IF NOT EXISTS oauth_states (state TEXT PRIMARY KEY, code_verifier TEXT NOT NULL, provider TEXT NOT NULL, created_at INTEGER NOT NULL)", allocator); !ok {
+        if len(storage_last_error) == 0 { storage_last_error = "schema ensure failed (oauth_states)" }
+        return false
+    }
     return true
 }
 
@@ -715,6 +720,117 @@ delete_challenge_any :: proc(challenge: string, allocator := context.temp_alloca
     q := fmt.tprintf("DELETE FROM webauthn_challenges_any WHERE challenge = %s", ch)
     _, ok := turso_execute(q, allocator)
     return ok
+}
+
+// -----------------------
+// OAuth helpers (state storage + HTTPS form post)
+// -----------------------
+
+oauth_insert_state :: proc(state: string, code_verifier: string, provider: string, allocator := context.temp_allocator) -> bool {
+    if !turso_enabled { return false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return false }
+    st := sql_quote(state, allocator)
+    cv := sql_quote(code_verifier, allocator)
+    pr := sql_quote(provider, allocator)
+    sql := fmt.tprintf("INSERT OR REPLACE INTO oauth_states(state, code_verifier, provider, created_at) VALUES (%s,%s,%s,CAST(strftime('%%s','now') AS INTEGER))", st, cv, pr)
+    _, ok := turso_execute(sql, allocator)
+    return ok
+}
+
+oauth_take_state :: proc(state: string, allocator := context.temp_allocator) -> (code_verifier: string, provider: string, ok: bool) {
+    if !turso_enabled { return "", "", false }
+    ensure_schema_if_needed()
+    if !turso_schema_ready { return "", "", false }
+    st := sql_quote(state, allocator)
+    q := fmt.tprintf("SELECT code_verifier, provider FROM oauth_states WHERE state = %s LIMIT 1", st)
+    res, rok := turso_execute(q, allocator)
+    if !rok || len(res.rows) == 0 { return "", "", false }
+    r := res.rows[0]
+    if len(r) < 2 { return "", "", false }
+    // delete state after reading
+    _, _ = turso_execute(fmt.tprintf("DELETE FROM oauth_states WHERE state = %s", st), allocator)
+    return r[0], r[1], true
+}
+
+// Minimal HTTPS POST with arbitrary content-type (modeled after https_post_json)
+https_post_raw :: proc(target_url: string, content_type: string, body_str: string, extra_headers: []string, allocator := context.temp_allocator) -> (status: int, body: string, ok: bool) {
+    if !strings.has_prefix(target_url, "https://") { return 0, "", false }
+    rest := target_url[8:]
+    slash := strings.index_byte(rest, '/')
+    hostport := rest
+    path := "/"
+    if slash >= 0 { hostport = rest[:slash]; path = rest[slash:] }
+    colon := strings.index_byte(hostport, ':')
+    host := hostport
+    port := 443
+    if colon >= 0 {
+        host = hostport[:colon]
+        if p, okp := strconv.parse_int(hostport[colon+1:], 10); okp { port = p }
+    }
+    ep4, ep6, rerr := net.resolve(host)
+    if rerr != nil { return 0, "", false }
+    endpoint := ep4 if ep4.address != nil else ep6
+    endpoint.port = port
+    sock, derr := net.dial_tcp(endpoint)
+    if derr != nil { return 0, "", false }
+    ctx := openssl.SSL_CTX_new(openssl.TLS_client_method())
+    ssl := openssl.SSL_new(ctx)
+    openssl.SSL_set_fd(ssl, c.int(sock))
+    chost := strings.clone_to_cstring(host, allocator)
+    defer delete(chost, allocator)
+    _ = openssl.SSL_set_tlsext_host_name(ssl, chost)
+    switch openssl.SSL_connect(ssl) { case 1: case 2: return 0, "", false; case: return 0, "", false }
+    // Build request
+    req := strings.builder_make(0, 256 + len(body_str), allocator)
+    strings.write_string(&req, "POST ")
+    strings.write_string(&req, path)
+    strings.write_string(&req, " HTTP/1.1\r\n")
+    strings.write_string(&req, "host: ")
+    strings.write_string(&req, host)
+    if port != 443 { strings.write_string(&req, fmt.tprintf(":%d", port)) }
+    strings.write_string(&req, "\r\n")
+    strings.write_string(&req, "accept: */*\r\n")
+    strings.write_string(&req, "user-agent: wasm-ui-server\r\n")
+    strings.write_string(&req, "connection: close\r\n")
+    for h in extra_headers { strings.write_string(&req, h); strings.write_string(&req, "\r\n") }
+    strings.write_string(&req, "content-type: ")
+    strings.write_string(&req, content_type)
+    strings.write_string(&req, "\r\n")
+    strings.write_string(&req, "content-length: ")
+    lbuf: [32]u8
+    strings.write_string(&req, strconv.itoa(lbuf[:], len(body_str)))
+    strings.write_string(&req, "\r\n\r\n")
+    strings.write_string(&req, body_str)
+    req_str := strings.to_string(req)
+    data := transmute([]byte)req_str
+    to_write := len(data)
+    for to_write > 0 { n := openssl.SSL_write(ssl, raw_data(data), c.int(to_write)); if n <= 0 { return 0, "", false }; data = data[n:]; to_write -= int(n) }
+    // Read response
+    buff: [4096]byte
+    out: bytes.Buffer
+    bytes.buffer_init_allocator(&out, 0, 0, allocator)
+    defer bytes.buffer_destroy(&out)
+    for {
+        r := openssl.SSL_read(ssl, &buff[0], c.int(len(buff)))
+        if r <= 0 { break }
+        bytes.buffer_write(&out, buff[:r])
+    }
+    openssl.SSL_free(ssl)
+    openssl.SSL_CTX_free(ctx)
+    net.close(sock)
+    resp := string(bytes.buffer_to_bytes(&out))
+    line_end := strings.index(resp, "\r\n")
+    if line_end <= 0 { return 0, "", false }
+    status_part := resp[:line_end]
+    sp1 := strings.index_byte(status_part, ' ') ; if sp1 < 0 { return 0, "", false }
+    sp2 := strings.index_byte(status_part[sp1+1:], ' '); if sp2 < 0 { return 0, "", false }
+    code_str := status_part[sp1+1: sp1+1+sp2]
+    code, okc := strconv.parse_int(code_str, 10); if !okc { return 0, "", false }
+    sep := strings.index(resp, "\r\n\r\n")
+    b := ""
+    if sep >= 0 { b = resp[sep+4:] }
+    return code, b, true
 }
 
 insert_credential :: proc(cred: Credential, allocator := context.temp_allocator) -> bool {

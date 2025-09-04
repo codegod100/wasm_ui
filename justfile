@@ -25,6 +25,10 @@ build-all: build build-server
 serve: build-all
 	./server_bin
 
+# Run the server with debug logs
+serve-debug: build-all
+	LOG_LEVEL=debug ./server_bin
+
 # Fetch vendored dependencies (odin-http)
 vendor:
 	mkdir -p vendor
